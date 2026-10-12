@@ -224,6 +224,9 @@ fun VideoQualitySelectorDialog(
                                         Text(
                                             text = when {
                                                 item.mimeType.contains("mpegurl", true) || item.url.contains("m3u8", true) -> "HLS STREAM"
+                                                item.mimeType.contains("dash", true) || item.url.contains(".mpd", true) -> "DASH STREAM"
+                                                item.mimeType.contains("android.package", true) || item.url.contains(".apk", true) -> "APK"
+                                                item.mimeType.contains("zip", true) || item.url.contains(".zip", true) -> "ZIP ARŞİV"
                                                 isAudio -> "SES (M4A)"
                                                 item.mimeType.contains("webm", true) -> "WEBM"
                                                 else -> "MP4 VİDEO"

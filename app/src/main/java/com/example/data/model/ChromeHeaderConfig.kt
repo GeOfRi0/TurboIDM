@@ -100,6 +100,16 @@ data class ChromeHeaderConfig(
             builder.header("Origin", "https://www.youtube.com")
         } else if (lower.contains("cdninstagram.com") || lower.contains("instagram.com")) {
             builder.header("Origin", "https://www.instagram.com")
+        } else if (ref.isNotBlank()) {
+            try {
+                val originUri = URI(ref)
+                val scheme = originUri.scheme ?: "https"
+                val host = originUri.host
+                if (!host.isNullOrBlank()) {
+                    val portStr = if (originUri.port != -1 && originUri.port != 80 && originUri.port != 443) ":${originUri.port}" else ""
+                    builder.header("Origin", "$scheme://$host$portStr")
+                }
+            } catch (e: Exception) {}
         }
 
         // Cookies

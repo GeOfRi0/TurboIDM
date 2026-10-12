@@ -118,6 +118,19 @@ class TurboDownloadEngine(
         val guessedName = customFileName ?: extractFileNameFromUrl(cleanUrl)
         val initialCategory = FileCategory.detect(guessedName, "")
 
+        val effectiveCookies = if (!headerConfig?.customCookies.isNullOrBlank()) {
+            headerConfig?.customCookies
+        } else {
+            try {
+                android.webkit.CookieManager.getInstance().getCookie(cleanUrl)
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        val effectiveUserAgent = headerConfig?.effectiveUserAgent ?: BROWSER_USER_AGENT
+        val effectiveReferer = headerConfig?.customReferer
+
         val entity = DownloadEntity(
             id = downloadId,
             url = cleanUrl,
@@ -131,9 +144,9 @@ class TurboDownloadEngine(
             speedBytesPerSec = 0L,
             threadCount = threadCount.coerceIn(1, 8),
             createdAt = System.currentTimeMillis(),
-            userAgent = headerConfig?.effectiveUserAgent,
-            referer = headerConfig?.customReferer,
-            cookies = headerConfig?.customCookies,
+            userAgent = effectiveUserAgent,
+            referer = effectiveReferer,
+            cookies = effectiveCookies,
             extraHeadersJson = headerConfig?.toExtraHeadersJson()
         )
         downloadDao.insert(entity)
@@ -297,12 +310,17 @@ class TurboDownloadEngine(
                 ?: sniffed.firstOrNull { it.url != initialEntity.url }
 
             if (directMedia != null) {
+                val mediaHeaders = directMedia.headerConfig
                 executeDownload(
                     initialEntity.copy(
                         url = directMedia.url,
                         fileName = directMedia.title,
                         mimeType = directMedia.mimeType,
-                        category = directMedia.category.name
+                        category = directMedia.category.name,
+                        userAgent = mediaHeaders?.effectiveUserAgent ?: initialEntity.userAgent,
+                        referer = mediaHeaders?.customReferer ?: initialEntity.referer ?: initialEntity.url,
+                        cookies = mediaHeaders?.customCookies ?: initialEntity.cookies,
+                        extraHeadersJson = mediaHeaders?.toExtraHeadersJson() ?: initialEntity.extraHeadersJson
                     )
                 )
                 return@withContext

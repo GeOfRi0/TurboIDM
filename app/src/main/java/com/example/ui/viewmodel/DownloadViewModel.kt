@@ -121,20 +121,35 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         _selectedTab.value = 3
     }
 
-    fun addCapturedMedia(url: String, title: String, mimeType: String, approxSize: Long = -1L, thumbnail: String? = null) {
+    fun addCapturedMedia(
+        url: String,
+        title: String,
+        mimeType: String,
+        approxSize: Long = -1L,
+        thumbnail: String? = null,
+        headerConfig: ChromeHeaderConfig? = null
+    ) {
         val current = _capturedMediaList.value.toMutableList()
         if (current.none { it.url == url }) {
+            val category = FileCategory.detect(title, mimeType)
             val item = ExtractedMedia(
                 url = url,
                 title = title,
-                category = FileCategory.MEDIA,
+                category = category,
                 mimeType = mimeType,
                 approxSize = approxSize,
-                thumbnailUrl = thumbnail
+                thumbnailUrl = thumbnail,
+                headerConfig = headerConfig
             )
             current.add(0, item)
             _capturedMediaList.value = current
-            Toast.makeText(getApplication(), "⚡ Video Akışı Yakalandı: $title", Toast.LENGTH_SHORT).show()
+            val typeDesc = when (category) {
+                FileCategory.APKS -> "Uygulama (APK)"
+                FileCategory.ARCHIVES -> "Arşiv (ZIP)"
+                FileCategory.MEDIA -> if (mimeType.startsWith("audio/")) "Ses Parçası" else "Video Akışı"
+                else -> "Dosya"
+            }
+            Toast.makeText(getApplication(), "⚡ $typeDesc Yakalandı: $title", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -142,10 +157,10 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         _capturedMediaList.value = emptyList()
     }
 
-    fun sniffSubframeMedia(iframeUrl: String, parentTitle: String = "") {
+    fun sniffSubframeMedia(iframeUrl: String, parentTitle: String = "", parentHeaderConfig: ChromeHeaderConfig? = null) {
         viewModelScope.launch {
             try {
-                val headerConfig = buildCurrentHeaderConfig()
+                val headerConfig = parentHeaderConfig ?: buildCurrentHeaderConfig()
                 val results = repository.sniffMedia(iframeUrl, headerConfig)
                 val mediaResults = results.filter { it.category == FileCategory.MEDIA && it.url != iframeUrl }
                 for (media in mediaResults) {
@@ -154,7 +169,8 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
                         title = if (media.title.isNotBlank() && media.title != "Video") media.title else "İframe Akışı - ${parentTitle.ifBlank { "Video" }}",
                         mimeType = media.mimeType,
                         approxSize = media.approxSize,
-                        thumbnail = media.thumbnailUrl
+                        thumbnail = media.thumbnailUrl,
+                        headerConfig = media.headerConfig ?: headerConfig
                     )
                 }
             } catch (_: Exception) {}
@@ -199,18 +215,22 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
             _isAnalyzingResolutions.value = true
             Toast.makeText(getApplication(), "🔍 Video çözünürlükleri taranıyor (1080p, 720p, 480p...)", Toast.LENGTH_SHORT).show()
             try {
-                val headerConfig = buildCurrentHeaderConfig()
+                val headerConfig = media.headerConfig ?: buildCurrentHeaderConfig()
                 val resolutions = repository.analyzeVideoResolutions(media, currentWebUrl, headerConfig)
-                if (resolutions.isNotEmpty()) {
-                    _qualityOptions.value = resolutions
+                val resolutionsWithHeaders = resolutions.map { res ->
+                    if (res.headerConfig == null) res.copy(headerConfig = headerConfig) else res
+                }
+                if (resolutionsWithHeaders.isNotEmpty()) {
+                    _qualityOptions.value = resolutionsWithHeaders
                     _showQualitySelector.value = true
                 } else {
-                    _qualityOptions.value = listOf(media)
+                    _qualityOptions.value = listOf(media.copy(headerConfig = headerConfig))
                     _showQualitySelector.value = true
                 }
             } catch (e: Exception) {
                 Toast.makeText(getApplication(), "Çözünürlük analiz hatası: ${e.message}", Toast.LENGTH_SHORT).show()
-                _qualityOptions.value = listOf(media)
+                val fallbackConfig = media.headerConfig ?: buildCurrentHeaderConfig()
+                _qualityOptions.value = listOf(media.copy(headerConfig = fallbackConfig))
                 _showQualitySelector.value = true
             } finally {
                 _isAnalyzingResolutions.value = false
@@ -220,7 +240,7 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
     fun selectAndDownloadQuality(media: ExtractedMedia, threadCount: Int = selectedThreads.value) {
         _showQualitySelector.value = false
-        val headerConfig = buildCurrentHeaderConfig()
+        val headerConfig = media.headerConfig ?: buildCurrentHeaderConfig()
         viewModelScope.launch {
             repository.enqueueDownload(
                 url = media.url,
@@ -466,7 +486,11 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         )
     }
 
-    fun startDirectDownload(url: String = urlInput.value) {
+    fun startDirectDownload(
+        url: String = urlInput.value,
+        headerConfig: ChromeHeaderConfig? = null,
+        customFileName: String? = null
+    ) {
         val cleanUrl = normalizeUrl(url)
         if (cleanUrl.isBlank()) {
             Toast.makeText(getApplication(), "Lütfen geçerli bir bağlantı adresi girin", Toast.LENGTH_SHORT).show()
@@ -475,13 +499,13 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
         viewModelScope.launch {
             try {
-                val headerConfig = buildCurrentHeaderConfig()
+                val effectiveHeaders = headerConfig ?: buildCurrentHeaderConfig()
 
                 // If URL is a video site (YouTube, Instagram, TikTok, etc.) or web page, resolve media first instead of saving HTML as .bin
                 if (isLikelyWebPage(cleanUrl)) {
                     _isSniffing.value = true
                     Toast.makeText(getApplication(), "Medya akışları ve kaliteler çözümleniyor...", Toast.LENGTH_SHORT).show()
-                    val results = repository.sniffMedia(cleanUrl, headerConfig)
+                    val results = repository.sniffMedia(cleanUrl, effectiveHeaders)
                     _isSniffing.value = false
 
                     val isInstagram = cleanUrl.contains("instagram.com")
@@ -493,7 +517,7 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
                                 url = media.url,
                                 customFileName = media.title,
                                 threadCount = selectedThreads.value,
-                                headerConfig = headerConfig
+                                headerConfig = media.headerConfig ?: effectiveHeaders
                             )
                             urlInput.value = ""
                             Toast.makeText(getApplication(), "Instagram videosu indiriliyor: ${media.title} 🚀", Toast.LENGTH_SHORT).show()
@@ -516,7 +540,7 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
                             url = media.url,
                             customFileName = media.title,
                             threadCount = selectedThreads.value,
-                            headerConfig = headerConfig
+                            headerConfig = media.headerConfig ?: effectiveHeaders
                         )
                         urlInput.value = ""
                         Toast.makeText(getApplication(), "Medya çözümlendi: ${media.title} indiriliyor 🚀", Toast.LENGTH_SHORT).show()
@@ -536,8 +560,9 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
                 repository.enqueueDownload(
                     url = cleanUrl,
+                    customFileName = customFileName,
                     threadCount = selectedThreads.value,
-                    headerConfig = headerConfig
+                    headerConfig = effectiveHeaders
                 )
                 urlInput.value = ""
                 Toast.makeText(getApplication(), "İndirme başlatıldı 🚀 (Chrome Kimliği Aktif)", Toast.LENGTH_SHORT).show()
@@ -640,12 +665,16 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         }
 
         viewModelScope.launch {
-            val headerConfig = buildCurrentHeaderConfig()
-            repository.enqueueBatch(
-                items = selected.map { it.url to it.title },
-                threadCount = selectedThreads.value,
-                headerConfig = headerConfig
-            )
+            val baseHeaderConfig = buildCurrentHeaderConfig()
+            for (item in selected) {
+                val effectiveHeader = item.headerConfig ?: baseHeaderConfig
+                repository.enqueueDownload(
+                    url = item.url,
+                    customFileName = item.title,
+                    threadCount = selectedThreads.value,
+                    headerConfig = effectiveHeader
+                )
+            }
             _showSnifferSheet.value = false
             _sniffedList.value = emptyList()
             urlInput.value = ""

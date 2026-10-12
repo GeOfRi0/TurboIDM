@@ -4,7 +4,9 @@ import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.os.Build
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -90,8 +92,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.engine.OkHttpProvider
+import com.example.data.model.ChromeHeaderConfig
 import com.example.data.model.ChromePreset
 import com.example.data.model.ExtractedMedia
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import okhttp3.Request
 import com.example.ui.theme.AccentGreen
 import com.example.ui.theme.CyberCyan
 import com.example.ui.theme.DarkCard
@@ -384,16 +392,111 @@ fun WebSnifferBrowserScreen(
                             }
                         }
 
-                        // JavaScript Interface to catch HTML5 video events
+                        // Intercept direct file downloads (APK, ZIP, MP4, etc.)
+                        setDownloadListener { downloadUrl, userAgent, contentDisposition, mimetype, _ ->
+                            val cookieManager = CookieManager.getInstance()
+                            val cookies = try {
+                                cookieManager.getCookie(downloadUrl) ?: cookieManager.getCookie(url)
+                            } catch (e: Exception) {
+                                null
+                            }
+                            val referer = url ?: urlInputText
+                            val effectiveUa = if (!userAgent.isNullOrBlank()) {
+                                userAgent
+                            } else {
+                                settings.userAgentString.ifBlank {
+                                    if (isDesktopMode) DESKTOP_CHROME_USER_AGENT else ChromePreset.CHROME_ANDROID.userAgent
+                                }
+                            }
+                            val headerConfig = ChromeHeaderConfig(
+                                preset = ChromePreset.CUSTOM,
+                                customUserAgent = effectiveUa,
+                                customReferer = referer,
+                                customCookies = cookies
+                            )
+                            val guessedName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimetype)
+                            val title = guessedName.ifBlank { pageTitle.ifBlank { "İndirilebilir Dosya" } }
+                            val mime = mimetype?.ifBlank { null } ?: when {
+                                downloadUrl.contains(".apk", ignoreCase = true) -> "application/vnd.android.package-archive"
+                                downloadUrl.contains(".zip", ignoreCase = true) -> "application/zip"
+                                downloadUrl.contains(".mp4", ignoreCase = true) -> "video/mp4"
+                                else -> "application/octet-stream"
+                            }
+
+                            post {
+                                viewModel.addCapturedMedia(
+                                    url = downloadUrl,
+                                    title = title,
+                                    mimeType = mime,
+                                    headerConfig = headerConfig
+                                )
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "İndirme Yakalandı: $title 📥",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+
+                        // JavaScript Interface to catch HTML5 video events, XHR/fetch streams, and download links
                         addJavascriptInterface(
                             object {
                                 @JavascriptInterface
                                 fun onMediaDetected(url: String, title: String) {
+                                    onMediaDetectedWithDetails(url, title, "")
+                                }
+
+                                @JavascriptInterface
+                                fun onMediaDetectedWithDetails(url: String, title: String, mimeType: String) {
+                                    if (url.isBlank() || url.startsWith("blob:") || url.startsWith("data:")) return
                                     post {
+                                        val cookieManager = CookieManager.getInstance()
+                                        val currentWvUrl = this@apply.url
+                                        val cookie = try {
+                                            cookieManager.getCookie(url) ?: cookieManager.getCookie(currentWvUrl)
+                                        } catch (e: Exception) {
+                                            null
+                                        }
+                                        val referer = currentWvUrl ?: urlInputText
+                                        val ua = this@apply.settings.userAgentString.ifBlank {
+                                            if (isDesktopMode) DESKTOP_CHROME_USER_AGENT else ChromePreset.CHROME_ANDROID.userAgent
+                                        }
+                                        val headerConfig = ChromeHeaderConfig(
+                                            preset = ChromePreset.CUSTOM,
+                                            customUserAgent = ua,
+                                            customReferer = referer,
+                                            customCookies = cookie
+                                        )
+
+                                        val resolvedMime = when {
+                                            mimeType.isNotBlank() -> mimeType
+                                            url.contains(".m3u8", ignoreCase = true) -> "application/vnd.apple.mpegurl"
+                                            url.contains(".mpd", ignoreCase = true) -> "application/dash+xml"
+                                            url.contains(".apk", ignoreCase = true) -> "application/vnd.android.package-archive"
+                                            url.contains(".zip", ignoreCase = true) -> "application/zip"
+                                            url.contains(".webm", ignoreCase = true) -> "video/webm"
+                                            url.contains(".mp3", ignoreCase = true) -> "audio/mpeg"
+                                            url.contains(".m4a", ignoreCase = true) -> "audio/mp4"
+                                            else -> "video/mp4"
+                                        }
+
+                                        val resolvedTitle = title.ifBlank {
+                                            pageTitle.ifBlank {
+                                                when {
+                                                    url.contains(".apk", ignoreCase = true) -> "APK Paketi"
+                                                    url.contains(".zip", ignoreCase = true) -> "ZIP Arşivi"
+                                                    url.contains(".mpd", ignoreCase = true) -> "DASH Medya Akışı"
+                                                    url.contains(".m3u8", ignoreCase = true) -> "HLS Medya Akışı"
+                                                    else -> "Web Medyası"
+                                                }
+                                            }
+                                        }
+
                                         viewModel.addCapturedMedia(
                                             url = url,
-                                            title = title.ifBlank { pageTitle.ifBlank { "Web Videosu" } },
-                                            mimeType = "video/mp4"
+                                            title = resolvedTitle,
+                                            mimeType = resolvedMime,
+                                            headerConfig = headerConfig
                                         )
                                     }
                                 }
@@ -440,7 +543,8 @@ fun WebSnifferBrowserScreen(
                                     lower.endsWith(".woff2") || lower.endsWith(".ttf") || lower.endsWith(".ico") ||
                                     lower.contains("/analytics") || lower.contains("/pixel") || lower.contains("/telemetry") ||
                                     lower.contains("google-analytics.com") || lower.contains("googletagmanager.com")) &&
-                                    !lower.contains("videoplayback")
+                                    !lower.contains("videoplayback") && !lower.contains(".m3u8") && !lower.contains(".mpd") &&
+                                    !lower.contains(".mp4") && !lower.contains(".apk") && !lower.contains(".zip")
 
                                 if (isStaticAsset) {
                                     return super.shouldInterceptRequest(view, request)
@@ -457,18 +561,33 @@ fun WebSnifferBrowserScreen(
                                 val secDest = headers["Sec-Fetch-Dest"]?.lowercase() ?: ""
                                 val accept = headers["Accept"]?.lowercase() ?: ""
                                 val isMediaHeader = secDest == "video" || secDest == "audio" ||
-                                    accept.contains("video/") || accept.contains("audio/")
+                                    accept.contains("video/") || accept.contains("audio/") ||
+                                    accept.contains("mpegurl") || accept.contains("dash+xml")
 
-                                // Direct video stream detection (applies to both main frame and iframe requests)
+                                val isApkOrZip = lower.endsWith(".apk") || lower.contains(".apk?") ||
+                                    lower.endsWith(".xapk") || lower.contains(".xapk?") ||
+                                    lower.endsWith(".apks") || lower.contains(".apks?") ||
+                                    lower.endsWith(".zip") || lower.contains(".zip?") ||
+                                    lower.endsWith(".rar") || lower.contains(".rar?") ||
+                                    lower.endsWith(".7z") || lower.contains(".7z?") ||
+                                    lower.endsWith(".tar") || lower.contains(".tar?") ||
+                                    lower.endsWith(".gz") || lower.contains(".gz?") ||
+                                    accept.contains("vnd.android.package-archive") ||
+                                    accept.contains("application/zip") ||
+                                    accept.contains("application/x-zip")
+
+                                // Direct video/media stream detection (applies to both main frame and iframe requests)
                                 val isDirectVideoStream = (lower.contains(".mp4") || lower.contains(".m3u8") ||
                                     lower.contains(".webm") || lower.contains(".ts") || lower.contains(".mpd") ||
                                     lower.contains(".m4s") || lower.contains(".m4v") || lower.contains(".mov") ||
                                     lower.contains(".flv") || lower.contains(".f4v") || lower.contains(".mkv") ||
+                                    lower.contains(".mp3") || lower.contains(".m4a") || lower.contains(".aac") ||
+                                    lower.contains(".wav") || lower.contains(".ogg") || lower.contains(".flac") || lower.contains(".opus") ||
                                     lower.contains("videoplayback") || (lower.contains("cdninstagram.com") && lower.contains("t50.")) ||
                                     lower.contains("/hls/") || lower.contains("/dash/") || lower.contains("playlist.m3u8") ||
-                                    lower.contains("master.m3u8") || lower.contains("chunklist") ||
-                                    lower.contains("mime=video") || lower.contains("format=m3u8") || lower.contains("type=video") ||
-                                    isMediaHeader)
+                                    lower.contains("master.m3u8") || lower.contains("chunklist") || lower.contains("manifest.mpd") ||
+                                    lower.contains("mime=video") || lower.contains("format=m3u8") || lower.contains("format=dash") ||
+                                    lower.contains("type=video") || isMediaHeader)
 
                                 // Subframe / iframe embed request detection
                                 // CRITICAL: Intercept all iframe (subframe) requests to capture embedded players!
@@ -484,7 +603,34 @@ fun WebSnifferBrowserScreen(
                                     lower.contains("mp4upload.")
                                 )
 
-                                if (isDirectVideoStream || isIframeEmbed) {
+                                // Extract comprehensive Chrome headers (Cookie, Referer, User-Agent, Origin)
+                                val cookieManager = CookieManager.getInstance()
+                                val cookieFromManager = try {
+                                    cookieManager.getCookie(reqUrl) ?: view?.url?.let { cookieManager.getCookie(it) }
+                                } catch (e: Exception) {
+                                    null
+                                }
+                                val cookieFromHeaders = headers["Cookie"] ?: headers["cookie"]
+                                val effectiveCookie = listOfNotNull(cookieFromManager, cookieFromHeaders).distinct().joinToString("; ").ifBlank { null }
+                                val effectiveReferer = headers["Referer"] ?: headers["referer"] ?: view?.url ?: urlInputText
+                                val effectiveUserAgent = headers["User-Agent"] ?: headers["user-agent"] ?: view?.settings?.userAgentString ?: if (isDesktopMode) DESKTOP_CHROME_USER_AGENT else ChromePreset.CHROME_ANDROID.userAgent
+
+                                val extraHeaders = mutableMapOf<String, String>()
+                                headers["Origin"]?.let { extraHeaders["Origin"] = it }
+                                headers["origin"]?.let { extraHeaders["Origin"] = it }
+                                headers["Sec-Fetch-Dest"]?.let { extraHeaders["Sec-Fetch-Dest"] = it }
+                                headers["Sec-Fetch-Mode"]?.let { extraHeaders["Sec-Fetch-Mode"] = it }
+                                headers["Sec-Fetch-Site"]?.let { extraHeaders["Sec-Fetch-Site"] = it }
+
+                                val capturedHeaderConfig = ChromeHeaderConfig(
+                                    preset = ChromePreset.CUSTOM,
+                                    customUserAgent = effectiveUserAgent,
+                                    customReferer = effectiveReferer,
+                                    customCookies = effectiveCookie,
+                                    extraHeaders = extraHeaders
+                                )
+
+                                if (isDirectVideoStream || isApkOrZip || isIframeEmbed) {
                                     val isYouTube = lower.contains("videoplayback") || lower.contains("googlevideo.com")
                                     val cleanStreamUrl = if (isYouTube && reqUrl.contains("&range=")) {
                                         reqUrl.replace(Regex("""&range=\d+-\d+"""), "")
@@ -493,10 +639,13 @@ fun WebSnifferBrowserScreen(
                                     }
 
                                     val mime = when {
-                                        lower.contains(".m3u8") || lower.contains("format=m3u8") -> "application/vnd.apple.mpegurl"
-                                        lower.contains(".mpd") -> "application/dash+xml"
+                                        lower.contains(".m3u8") || lower.contains("format=m3u8") || accept.contains("mpegurl") -> "application/vnd.apple.mpegurl"
+                                        lower.contains(".mpd") || lower.contains("format=dash") || accept.contains("dash+xml") -> "application/dash+xml"
+                                        isApkOrZip && (lower.contains(".apk") || accept.contains("package")) -> "application/vnd.android.package-archive"
+                                        isApkOrZip -> "application/zip"
                                         lower.contains(".webm") -> "video/webm"
-                                        lower.contains("itag=140") || secDest == "audio" -> "audio/mp4"
+                                        lower.contains(".mp3") -> "audio/mpeg"
+                                        lower.contains(".m4a") || lower.contains("itag=140") || secDest == "audio" -> "audio/mp4"
                                         isIframeEmbed -> "video/mp4"
                                         else -> "video/mp4"
                                     }
@@ -512,11 +661,25 @@ fun WebSnifferBrowserScreen(
                                             }
                                             "YouTube Video ($quality) - ${pageTitle.ifBlank { "Akış" }}"
                                         }
+                                        lower.contains(".apk") -> {
+                                            val name = reqUrl.substringAfterLast('/').substringBefore('?').ifBlank { "Uygulama.apk" }
+                                            "APK Paketi ($name) - ${pageTitle.ifBlank { "İndirme" }}"
+                                        }
+                                        lower.contains(".zip") || lower.contains(".rar") || lower.contains(".7z") -> {
+                                            val name = reqUrl.substringAfterLast('/').substringBefore('?').ifBlank { "Dosya.zip" }
+                                            "Arşiv Dosyası ($name) - ${pageTitle.ifBlank { "İndirme" }}"
+                                        }
                                         isIframeEmbed -> {
                                             "Gömülü İframe Video - ${pageTitle.ifBlank { "Player" }}"
                                         }
                                         lower.contains("instagram.com") || lower.contains("cdninstagram.com") -> {
                                             "Instagram Video - ${pageTitle.ifBlank { "Reel" }}"
+                                        }
+                                        lower.contains(".mpd") -> {
+                                            "DASH Akışı (MPD) - ${pageTitle.ifBlank { "Video" }}"
+                                        }
+                                        lower.contains(".m3u8") -> {
+                                            "HLS Akışı (M3U8) - ${pageTitle.ifBlank { "Video" }}"
                                         }
                                         else -> pageTitle.ifBlank { "Web Medya Akışı" }
                                     }
@@ -525,13 +688,40 @@ fun WebSnifferBrowserScreen(
                                         viewModel.addCapturedMedia(
                                             url = cleanStreamUrl,
                                             title = streamTitle,
-                                            mimeType = mime
+                                            mimeType = mime,
+                                            headerConfig = capturedHeaderConfig
                                         )
                                     }
 
                                     // Deep sniff direct stream URLs inside iframe embed asynchronously
                                     if (isIframeEmbed && !isDirectVideoStream) {
-                                        viewModel.sniffSubframeMedia(reqUrl, pageTitle)
+                                        viewModel.sniffSubframeMedia(reqUrl, pageTitle, capturedHeaderConfig)
+                                    }
+                                } else if (request.method.equals("GET", ignoreCase = true) && !isForMainFrame &&
+                                    (lower.contains("stream") || lower.contains("video") || lower.contains("audio") ||
+                                     lower.contains("media") || lower.contains("playlist") || lower.contains("manifest") ||
+                                     lower.contains("download") || lower.contains("getfile"))) {
+                                    // Probe dynamic streaming/download endpoints without extension
+                                    CoroutineScope(Dispatchers.IO).launch {
+                                        try {
+                                            val probeBuilder = Request.Builder().url(reqUrl).head()
+                                            capturedHeaderConfig.applyTo(probeBuilder, reqUrl)
+                                            val resp = OkHttpProvider.client.newCall(probeBuilder.build()).execute()
+                                            val cType = resp.header("Content-Type").orEmpty().lowercase()
+                                            resp.close()
+                                            if (cType.contains("video/") || cType.contains("audio/") ||
+                                                cType.contains("mpegurl") || cType.contains("dash+xml") ||
+                                                cType.contains("vnd.android.package-archive") || cType.contains("zip")) {
+                                                post {
+                                                    viewModel.addCapturedMedia(
+                                                        url = reqUrl,
+                                                        title = pageTitle.ifBlank { "Dinamik Akış" },
+                                                        mimeType = cType,
+                                                        headerConfig = capturedHeaderConfig
+                                                    )
+                                                }
+                                            }
+                                        } catch (ignored: Exception) {}
                                     }
                                 }
 
@@ -545,12 +735,31 @@ fun WebSnifferBrowserScreen(
                             ): WebResourceResponse? {
                                 val reqUrl = url ?: return null
                                 val lower = reqUrl.lowercase()
-                                if (lower.contains(".mp4") || lower.contains(".m3u8") || lower.contains("videoplayback") || lower.contains(".webm")) {
+                                if (lower.contains(".mp4") || lower.contains(".m3u8") || lower.contains(".mpd") ||
+                                    lower.contains(".apk") || lower.contains(".zip") || lower.contains("videoplayback") || lower.contains(".webm")) {
+                                    val cookieManager = CookieManager.getInstance()
+                                    val cookie = try { cookieManager.getCookie(reqUrl) ?: view?.url?.let { cookieManager.getCookie(it) } } catch (e: Exception) { null }
+                                    val referer = view?.url ?: urlInputText
+                                    val ua = view?.settings?.userAgentString ?: if (isDesktopMode) DESKTOP_CHROME_USER_AGENT else ChromePreset.CHROME_ANDROID.userAgent
+                                    val headerConfig = ChromeHeaderConfig(
+                                        preset = ChromePreset.CUSTOM,
+                                        customUserAgent = ua,
+                                        customReferer = referer,
+                                        customCookies = cookie
+                                    )
+                                    val mime = when {
+                                        lower.contains(".m3u8") -> "application/vnd.apple.mpegurl"
+                                        lower.contains(".mpd") -> "application/dash+xml"
+                                        lower.contains(".apk") -> "application/vnd.android.package-archive"
+                                        lower.contains(".zip") -> "application/zip"
+                                        else -> "video/mp4"
+                                    }
                                     post {
                                         viewModel.addCapturedMedia(
                                             url = reqUrl,
-                                            title = pageTitle.ifBlank { "Web Video Akışı" },
-                                            mimeType = if (lower.contains(".m3u8")) "application/vnd.apple.mpegurl" else "video/mp4"
+                                            title = pageTitle.ifBlank { "Web Medya Akışı" },
+                                            mimeType = mime,
+                                            headerConfig = headerConfig
                                         )
                                     }
                                 }
@@ -845,7 +1054,11 @@ fun WebSnifferBrowserScreen(
                             IconButton(
                                 onClick = {
                                     showCapturedListSheet = false
-                                    viewModel.startDirectDownload(media.url)
+                                    viewModel.startDirectDownload(
+                                        url = media.url,
+                                        headerConfig = media.headerConfig,
+                                        customFileName = media.title
+                                    )
                                 },
                                 modifier = Modifier
                                     .size(36.dp)
@@ -943,18 +1156,96 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
         return null;
     }
 
-    function notifyMedia(src, title, win) {
+    function notifyMediaWithMime(src, title, mime, win) {
         if (!src) return;
         src = src.trim();
-        if (src.startsWith('http') && !src.startsWith('blob:') && !src.includes('analytics') && !src.includes('pixel') && !src.includes('favicon')) {
+        if (src.startsWith('http') && !src.startsWith('blob:') && !src.startsWith('data:') &&
+            !src.includes('analytics') && !src.includes('pixel') && !src.includes('favicon')) {
             var sniffer = getSniffer(win || window);
             if (sniffer) {
                 try {
-                    sniffer.onMediaDetected(src, title || document.title || 'Video');
+                    if (sniffer.onMediaDetectedWithDetails) {
+                        sniffer.onMediaDetectedWithDetails(src, title || document.title || 'Medya', mime || '');
+                    } else if (sniffer.onMediaDetected) {
+                        sniffer.onMediaDetected(src, title || document.title || 'Medya');
+                    }
                 } catch(e) {}
             }
         }
     }
+
+    function notifyMedia(src, title, win) {
+        notifyMediaWithMime(src, title, '', win);
+    }
+
+    // Hook window.fetch to inspect response Content-Type and media streams
+    try {
+        if (window.fetch && !window.__fetchSnifferAttached) {
+            window.__fetchSnifferAttached = true;
+            var originalFetch = window.fetch;
+            window.fetch = function() {
+                var args = arguments;
+                var fetchUrl = '';
+                if (typeof args[0] === 'string') {
+                    fetchUrl = args[0];
+                } else if (args[0] && args[0].url) {
+                    fetchUrl = args[0].url;
+                }
+                return originalFetch.apply(this, args).then(function(response) {
+                    try {
+                        if (response && response.url) {
+                            var rUrl = response.url;
+                            var cType = (response.headers && response.headers.get('content-type')) || '';
+                            var lowerUrl = rUrl.toLowerCase();
+                            var lowerType = cType.toLowerCase();
+                            if (lowerType.includes('video/') || lowerType.includes('audio/') ||
+                                lowerType.includes('mpegurl') || lowerType.includes('dash+xml') ||
+                                lowerType.includes('vnd.android.package-archive') || lowerType.includes('zip') ||
+                                lowerUrl.includes('.m3u8') || lowerUrl.includes('.mpd') || lowerUrl.includes('.mp4') ||
+                                lowerUrl.includes('.apk') || lowerUrl.includes('.zip')) {
+                                notifyMediaWithMime(rUrl, document.title || 'Medya Akışı', cType, window);
+                            }
+                        }
+                    } catch(e) {}
+                    return response;
+                });
+            };
+        }
+    } catch(e) {}
+
+    // Hook XMLHttpRequest to inspect response Content-Type and media streams
+    try {
+        if (window.XMLHttpRequest && !window.__xhrSnifferAttached) {
+            window.__xhrSnifferAttached = true;
+            var originalOpen = XMLHttpRequest.prototype.open;
+            var originalSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.__sniffUrl = url;
+                return originalOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                var xhr = this;
+                xhr.addEventListener('load', function() {
+                    try {
+                        var sUrl = xhr.responseURL || xhr.__sniffUrl;
+                        if (sUrl) {
+                            var cType = xhr.getResponseHeader('Content-Type') || '';
+                            var lowerUrl = sUrl.toLowerCase();
+                            var lowerType = cType.toLowerCase();
+                            if (lowerType.includes('video/') || lowerType.includes('audio/') ||
+                                lowerType.includes('mpegurl') || lowerType.includes('dash+xml') ||
+                                lowerType.includes('vnd.android.package-archive') || lowerType.includes('zip') ||
+                                lowerUrl.includes('.m3u8') || lowerUrl.includes('.mpd') || lowerUrl.includes('.mp4') ||
+                                lowerUrl.includes('.apk') || lowerUrl.includes('.zip')) {
+                                notifyMediaWithMime(sUrl, document.title || 'Medya Akışı', cType, window);
+                            }
+                        }
+                    } catch(e) {}
+                });
+                return originalSend.apply(this, arguments);
+            };
+        }
+    } catch(e) {}
 
     var PLAY_SELECTORS = [
         '.vjs-big-play-button',
@@ -1078,6 +1369,19 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
                     }
                 }, true);
             }
+        // Scan direct download and stream links
+        try {
+            var links = doc.querySelectorAll('a[href*=".apk"], a[href*=".zip"], a[href*=".m3u8"], a[href*=".mpd"], a[href*=".mp4"], a[download]');
+            links.forEach(function(a) {
+                var href = a.href;
+                if (href && href.startsWith('http')) {
+                    var lower = href.toLowerCase();
+                    if (lower.includes('.apk') || lower.includes('.zip') || lower.includes('.mp4') || lower.includes('.m3u8') || lower.includes('.mpd')) {
+                        var title = (a.innerText || '').trim() || a.getAttribute('download') || a.title || 'İndirme Bağlantısı';
+                        notifyMedia(href, title, win);
+                    }
+                }
+            });
         } catch(e) {}
 
         // 4. Scan iframes recursively inside this document

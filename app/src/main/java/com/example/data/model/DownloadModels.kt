@@ -28,8 +28,11 @@ enum class FileCategory(val label: String) {
                 lowerName.endsWith(".apk") || lowerName.endsWith(".xapk") || lowerName.endsWith(".apks") ||
                     lowerMime.contains("android.package-archive") || lowerMime.contains("application/vnd.android.package-archive") -> APKS
 
-                // 2. Media (MP4, MP3, Video & Audio)
+                // 2. Media (MP4, MP3, Video & Audio, HLS, DASH)
                 lowerMime.startsWith("video/") || lowerMime.startsWith("audio/") ||
+                    lowerMime.contains("mpegurl") || lowerMime.contains("dash+xml") ||
+                    lowerName.endsWith(".m3u8") || lowerName.endsWith(".mpd") ||
+                    lowerName.endsWith(".ts") || lowerName.endsWith(".m4s") ||
                     lowerName.endsWith(".mp4") || lowerName.endsWith(".mkv") || lowerName.endsWith(".webm") ||
                     lowerName.endsWith(".avi") || lowerName.endsWith(".mov") || lowerName.endsWith(".flv") ||
                     lowerName.endsWith(".3gp") || lowerName.endsWith(".mp3") || lowerName.endsWith(".wav") ||
@@ -66,7 +69,8 @@ data class ExtractedMedia(
     val mimeType: String,
     val approxSize: Long = -1L,
     val thumbnailUrl: String? = null,
-    val isSelected: Boolean = true
+    val isSelected: Boolean = true,
+    val headerConfig: ChromeHeaderConfig? = null
 )
 
 data class SegmentProgress(

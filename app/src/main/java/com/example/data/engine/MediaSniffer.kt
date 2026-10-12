@@ -32,9 +32,19 @@ class MediaSniffer(
 
         val lowerUrl = cleanUrl.lowercase()
 
+        val resolvedCookies = headerConfig?.customCookies?.takeIf { it.isNotBlank() } ?: try {
+            android.webkit.CookieManager.getInstance().getCookie(cleanUrl)
+        } catch (_: Exception) {
+            null
+        }
+        val effectiveHeaders = (headerConfig ?: ChromeHeaderConfig()).copy(
+            customReferer = headerConfig?.customReferer ?: cleanUrl,
+            customCookies = resolvedCookies
+        )
+
         // 1. Specialized YouTube Resolver
         if (lowerUrl.contains("youtube.com") || lowerUrl.contains("youtu.be")) {
-            val ytResults = resolveYouTube(cleanUrl, headerConfig)
+            val ytResults = resolveYouTube(cleanUrl, effectiveHeaders)
             if (ytResults.isNotEmpty()) {
                 return@withContext ytResults
             }
@@ -42,7 +52,7 @@ class MediaSniffer(
 
         // 2. Specialized Instagram Resolver
         if (lowerUrl.contains("instagram.com")) {
-            val igResults = resolveInstagram(cleanUrl, headerConfig)
+            val igResults = resolveInstagram(cleanUrl, effectiveHeaders)
             if (igResults.isNotEmpty()) {
                 return@withContext igResults
             }
@@ -50,13 +60,13 @@ class MediaSniffer(
 
         // 3. Specialized Twitter / X Resolver
         if (lowerUrl.contains("twitter.com") || lowerUrl.contains("x.com")) {
-            val twResults = resolveTwitter(cleanUrl, headerConfig)
+            val twResults = resolveTwitter(cleanUrl, effectiveHeaders)
             if (twResults.isNotEmpty()) {
                 return@withContext twResults
             }
         }
 
-        // 4. If URL directly points to a media or archive file (.mp4, .mkv, .mp3, .pdf, .zip, etc.)
+        // 4. If URL directly points to a media, stream, or archive file (.mp4, .m3u8, .mpd, .apk, .zip, etc.)
         if (hasMediaExtension(cleanUrl)) {
             val fileName = extractFileName(cleanUrl, "", "")
             val category = FileCategory.detect(fileName, "")
@@ -64,21 +74,12 @@ class MediaSniffer(
                 url = cleanUrl,
                 title = fileName,
                 category = category,
-                mimeType = when {
-                    fileName.endsWith(".mp4", true) -> "video/mp4"
-                    fileName.endsWith(".mkv", true) -> "video/x-matroska"
-                    fileName.endsWith(".webm", true) -> "video/webm"
-                    fileName.endsWith(".mp3", true) -> "audio/mpeg"
-                    fileName.endsWith(".pdf", true) -> "application/pdf"
-                    fileName.endsWith(".zip", true) -> "application/zip"
-                    fileName.endsWith(".apk", true) -> "application/vnd.android.package-archive"
-                    else -> "application/octet-stream"
-                },
+                mimeType = guessMimeType(fileName),
                 approxSize = -1L,
-                thumbnailUrl = if (category == FileCategory.MEDIA && (fileName.endsWith(".jpg", true) || fileName.endsWith(".png", true))) cleanUrl else null
+                thumbnailUrl = if (category == FileCategory.MEDIA && (fileName.endsWith(".jpg", true) || fileName.endsWith(".png", true))) cleanUrl else null,
+                headerConfig = effectiveHeaders
             )
             return@withContext try {
-                val effectiveHeaders = headerConfig ?: ChromeHeaderConfig()
                 val requestBuilder = Request.Builder().url(cleanUrl).head()
                 effectiveHeaders.applyTo(requestBuilder, cleanUrl)
                 val response = client.newCall(requestBuilder.build()).execute()
@@ -96,7 +97,8 @@ class MediaSniffer(
                         category = probedCategory,
                         mimeType = contentType.ifBlank { directItem.mimeType },
                         approxSize = contentLength,
-                        thumbnailUrl = directItem.thumbnailUrl
+                        thumbnailUrl = directItem.thumbnailUrl,
+                        headerConfig = effectiveHeaders
                     )
                 )
             } catch (e: Exception) {
@@ -106,7 +108,6 @@ class MediaSniffer(
 
         // 5. General Web Page & Sniffer
         try {
-            val effectiveHeaders = headerConfig ?: ChromeHeaderConfig()
             val requestBuilder = Request.Builder().url(cleanUrl)
             effectiveHeaders.applyTo(requestBuilder, cleanUrl)
 
@@ -136,7 +137,8 @@ class MediaSniffer(
                         category = category,
                         mimeType = contentType.ifBlank { "application/octet-stream" },
                         approxSize = contentLength,
-                        thumbnailUrl = if (category == FileCategory.MEDIA && contentType.startsWith("image/")) finalUrl else null
+                        thumbnailUrl = if (category == FileCategory.MEDIA && contentType.startsWith("image/")) finalUrl else null,
+                        headerConfig = effectiveHeaders
                     )
                 )
             }
@@ -145,7 +147,7 @@ class MediaSniffer(
             val responseBody = response.body?.string() ?: ""
             response.close()
 
-            val extracted = parseHtml(finalUrl, responseBody)
+            val extracted = parseHtml(finalUrl, responseBody, effectiveHeaders)
             return@withContext extracted
         } catch (e: Exception) {
             e.printStackTrace()
@@ -184,6 +186,8 @@ class MediaSniffer(
 
         val baseTitle = videoTitle?.let { sanitizeFileName(it) } ?: "YouTube_$videoId"
         val displayThumb = oembedThumb ?: "https://i.ytimg.com/vi/$videoId/maxresdefault.jpg"
+
+        val effectiveHeaders = headerConfig ?: ChromeHeaderConfig(customReferer = "https://www.youtube.com/")
 
         // 2. Query Invidious API instances for direct GoogleVideo MP4 streams
         val invidiousInstances = listOf(
@@ -229,7 +233,8 @@ class MediaSniffer(
                                         category = FileCategory.MEDIA,
                                         mimeType = "video/$container",
                                         approxSize = -1L,
-                                        thumbnailUrl = displayThumb
+                                        thumbnailUrl = displayThumb,
+                                        headerConfig = effectiveHeaders
                                     )
                                 )
                             }
@@ -254,7 +259,8 @@ class MediaSniffer(
                                         category = FileCategory.MEDIA,
                                         mimeType = "audio/mp4",
                                         approxSize = size,
-                                        thumbnailUrl = displayThumb
+                                        thumbnailUrl = displayThumb,
+                                        headerConfig = effectiveHeaders
                                     )
                                 )
                                 break
@@ -275,7 +281,7 @@ class MediaSniffer(
             try {
                 val watchUrl = "https://www.youtube.com/watch?v=$videoId&bpctr=9999999999&has_verified=1"
                 val reqBuilder = Request.Builder().url(watchUrl)
-                (headerConfig ?: ChromeHeaderConfig()).applyTo(reqBuilder, watchUrl)
+                effectiveHeaders.applyTo(reqBuilder, watchUrl)
                 val resp = client.newCall(reqBuilder.get().build()).execute()
                 val html = resp.body?.string().orEmpty()
                 resp.close()
@@ -290,25 +296,26 @@ class MediaSniffer(
                                 val fmt = formats.optJSONObject(i) ?: continue
                                 val directUrl = fmt.optString("url")
                                 if (directUrl.isNotBlank() && !seenStreamUrls.contains(directUrl)) {
-                                    seenStreamUrls.add(directUrl)
-                                    val quality = fmt.optString("qualityLabel").ifBlank {
-                                        val itag = fmt.optInt("itag")
-                                        if (itag == 22) "720p HD" else if (itag == 18) "360p" else "Standart"
-                                    }
-                                    val mime = fmt.optString("mimeType").substringBefore(';').ifBlank { "video/mp4" }
-                                    val ext = if (mime.contains("webm")) ".webm" else ".mp4"
-                                    val size = fmt.optLong("contentLength", -1L)
+                                seenStreamUrls.add(directUrl)
+                                val quality = fmt.optString("qualityLabel").ifBlank {
+                                    val itag = fmt.optInt("itag")
+                                    if (itag == 22) "720p HD" else if (itag == 18) "360p" else "Standart"
+                                }
+                                val mime = fmt.optString("mimeType").substringBefore(';').ifBlank { "video/mp4" }
+                                val ext = if (mime.contains("webm")) ".webm" else ".mp4"
+                                val size = fmt.optLong("contentLength", -1L)
 
-                                    results.add(
-                                        ExtractedMedia(
-                                            url = directUrl,
-                                            title = "$baseTitle - $quality ($ext)",
-                                            category = FileCategory.MEDIA,
-                                            mimeType = mime,
-                                            approxSize = size,
-                                            thumbnailUrl = displayThumb
-                                        )
+                                results.add(
+                                    ExtractedMedia(
+                                        url = directUrl,
+                                        title = "$baseTitle - $quality ($ext)",
+                                        category = FileCategory.MEDIA,
+                                        mimeType = mime,
+                                        approxSize = size,
+                                        thumbnailUrl = displayThumb,
+                                        headerConfig = effectiveHeaders
                                     )
+                                )
                                 }
                             }
                         }
@@ -327,7 +334,8 @@ class MediaSniffer(
                 category = FileCategory.MEDIA,
                 mimeType = "image/jpeg",
                 approxSize = -1L,
-                thumbnailUrl = displayThumb
+                thumbnailUrl = displayThumb,
+                headerConfig = effectiveHeaders
             )
         )
 
@@ -404,6 +412,7 @@ class MediaSniffer(
         val shortcode = extractInstagramShortcode(url) ?: return@withContext emptyList()
         val results = mutableListOf<ExtractedMedia>()
         val seenUrls = mutableSetOf<String>()
+        val effectiveHeaders = headerConfig ?: ChromeHeaderConfig(customReferer = "https://www.instagram.com/")
 
         fun addMedia(mediaUrl: String, title: String, mime: String, thumb: String? = null) {
             val cleanMedia = mediaUrl.replace("\\/", "/").replace("&amp;", "&").replace("\\u0026", "&").trim()
@@ -416,12 +425,11 @@ class MediaSniffer(
                     category = FileCategory.MEDIA,
                     mimeType = mime,
                     approxSize = -1L,
-                    thumbnailUrl = thumb ?: if (mime.startsWith("image/")) cleanMedia else null
+                    thumbnailUrl = thumb ?: if (mime.startsWith("image/")) cleanMedia else null,
+                    headerConfig = effectiveHeaders
                 )
             )
         }
-
-        val effectiveHeaders = headerConfig ?: ChromeHeaderConfig()
 
         // 1. Query Instagram embed captioned endpoint: https://www.instagram.com/p/{shortcode}/embed/captioned/
         try {
@@ -543,6 +551,7 @@ class MediaSniffer(
     ): List<ExtractedMedia> = withContext(Dispatchers.IO) {
         val tweetId = Regex("""(?:status|statuses)/(\d+)""").find(url)?.groupValues?.get(1) ?: return@withContext emptyList()
         val results = mutableListOf<ExtractedMedia>()
+        val effectiveHeaders = headerConfig ?: ChromeHeaderConfig(customReferer = "https://x.com/")
         try {
             val apiUrl = "https://api.fxtwitter.com/status/$tweetId"
             val req = Request.Builder().url(apiUrl).get().build()
@@ -566,7 +575,8 @@ class MediaSniffer(
                                         category = FileCategory.MEDIA,
                                         mimeType = "video/mp4",
                                         approxSize = -1L,
-                                        thumbnailUrl = thumb
+                                        thumbnailUrl = thumb,
+                                        headerConfig = effectiveHeaders
                                     )
                                 )
                             }
@@ -585,7 +595,8 @@ class MediaSniffer(
                                         category = FileCategory.MEDIA,
                                         mimeType = "image/jpeg",
                                         approxSize = -1L,
-                                        thumbnailUrl = pUrl
+                                        thumbnailUrl = pUrl,
+                                        headerConfig = effectiveHeaders
                                     )
                                 )
                             }
@@ -609,10 +620,13 @@ class MediaSniffer(
         return trimmed
     }
 
-    private fun parseHtml(baseUrl: String, html: String): List<ExtractedMedia> {
+    private fun parseHtml(baseUrl: String, html: String, headerConfig: ChromeHeaderConfig? = null): List<ExtractedMedia> {
         val results = mutableListOf<ExtractedMedia>()
         val seenUrls = mutableSetOf<String>()
         val baseHttpUrl = baseUrl.toHttpUrlOrNull()
+        val effectiveHeaders = (headerConfig ?: ChromeHeaderConfig()).copy(
+            customReferer = headerConfig?.customReferer ?: baseUrl
+        )
 
         // Extract page title for better naming
         val pageTitleMatcher = Pattern.compile("""<title[^>]*>(.*?)</title>""", Pattern.CASE_INSENSITIVE or Pattern.DOTALL).matcher(html)
@@ -653,7 +667,8 @@ class MediaSniffer(
                     category = category,
                     mimeType = guessMimeType(fileName),
                     approxSize = -1L,
-                    thumbnailUrl = if (category == FileCategory.MEDIA) resolvedUrl else null
+                    thumbnailUrl = if (category == FileCategory.MEDIA) resolvedUrl else null,
+                    headerConfig = effectiveHeaders
                 )
             )
         }
@@ -731,25 +746,33 @@ class MediaSniffer(
             val isExplicitMedia = hasMediaExtension(href)
             val isDownloadIntent = lowerText.contains("indir") || lowerText.contains("download") ||
                 lowerText.contains("720p") || lowerText.contains("1080p") || lowerText.contains("mp4") ||
-                lowerHref.contains("download") || lowerHref.contains("get_file") || lowerHref.contains("mediafire.com")
+                lowerText.contains("apk") || lowerText.contains("zip") ||
+                lowerHref.contains("download") || lowerHref.contains("get_file") || lowerHref.contains("mediafire.com") ||
+                lowerHref.contains(".apk") || lowerHref.contains(".zip") || lowerHref.contains(".m3u8") || lowerHref.contains(".mpd")
 
             if (isExplicitMedia || isDownloadIntent) {
                 addIfValid(href, title = rawText.takeIf { it.isNotBlank() })
             }
         }
 
-        // 7. Direct CDN stream scanner: GoogleVideo, Instagram, TikTok, FB, m3u8, mpd, mp4
-        val streamRegex = Pattern.compile("""https?(?::|%3A)(?:\\/\\/|//)[^"'\s<>\\]+?(?:\.googlevideo\.com/videoplayback|\.cdninstagram\.com/|\.tiktokcdn\.com/|\.fbcdn\.net/|\.m3u8|\.mpd|\.mp4|\.webm|\.mkv|\.apk|\.zip)[^"'\s<>\\]*""", Pattern.CASE_INSENSITIVE)
+        // 7. Direct CDN stream scanner: GoogleVideo, Instagram, TikTok, FB, m3u8, mpd, mp4, apk, zip
+        val streamRegex = Pattern.compile("""https?(?::|%3A)(?:\\/\\/|//)[^"'\s<>\\]+?(?:\.googlevideo\.com/videoplayback|\.cdninstagram\.com/|\.tiktokcdn\.com/|\.fbcdn\.net/|\.m3u8|\.mpd|\.mp4|\.webm|\.mkv|\.apk|\.xapk|\.zip|\.rar|\.7z)[^"'\s<>\\]*""", Pattern.CASE_INSENSITIVE)
         val streamMatcher = streamRegex.matcher(html)
         var streamCount = 0
         while (streamMatcher.find() && streamCount < 40) {
             val foundUrl = streamMatcher.group(0) ?: continue
-            addIfValid(foundUrl, forcedCategory = FileCategory.MEDIA)
+            val lowerFound = foundUrl.lowercase()
+            val forcedCat = when {
+                lowerFound.contains(".apk") || lowerFound.contains(".xapk") -> FileCategory.APKS
+                lowerFound.contains(".zip") || lowerFound.contains(".rar") || lowerFound.contains(".7z") -> FileCategory.ARCHIVES
+                else -> FileCategory.MEDIA
+            }
+            addIfValid(foundUrl, forcedCategory = forcedCat)
             streamCount++
         }
 
         // 8. Inline JavaScript / JSON Stream Scanner
-        val inlineMediaRegex = Pattern.compile("""https?(?::|%3A)(?:\\/\\/|//)[^"'\s<>\\]+?\.(?:mp4|mkv|webm|mov|m3u8|mp3|wav|jpg|jpeg|png|webp|gif|pdf|zip|rar|7z|apk)(?:\?[^"'\s<>\\]*)?""", Pattern.CASE_INSENSITIVE)
+        val inlineMediaRegex = Pattern.compile("""https?(?::|%3A)(?:\\/\\/|//)[^"'\s<>\\]+?\.(?:mp4|mkv|webm|mov|m3u8|mpd|ts|m4s|mp3|wav|ogg|aac|flac|jpg|jpeg|png|webp|gif|pdf|zip|rar|7z|apk|xapk)(?:\?[^"'\s<>\\]*)?""", Pattern.CASE_INSENSITIVE)
         val inlineMatcher = inlineMediaRegex.matcher(html)
         var inlineCount = 0
         while (inlineMatcher.find() && inlineCount < 40) {
@@ -840,8 +863,9 @@ class MediaSniffer(
             ".mp4", ".mkv", ".webm", ".avi", ".mov", ".3gp", ".flv",
             ".jpg", ".jpeg", ".png", ".webp", ".gif",
             ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a",
-            ".pdf", ".zip", ".rar", ".7z", ".apk", ".tar", ".gz",
-            ".docx", ".xlsx", ".pptx", ".iso", ".exe", ".dmg"
+            ".pdf", ".zip", ".rar", ".7z", ".apk", ".xapk", ".apks", ".tar", ".gz",
+            ".docx", ".xlsx", ".pptx", ".iso", ".exe", ".dmg",
+            ".m3u8", ".mpd", ".ts", ".m4s", ".m4v", ".f4v"
         )
         return extensions.any { clean.endsWith(it) }
     }
@@ -884,13 +908,18 @@ class MediaSniffer(
             lowerMime.contains("mp4") || lowerMime.contains("m4v") -> ".mp4"
             lowerMime.contains("webm") -> ".webm"
             lowerMime.contains("mkv") || lowerMime.contains("matroska") -> ".mkv"
+            lowerMime.contains("mpegurl") || lowerMime.contains("m3u8") -> ".m3u8"
+            lowerMime.contains("dash+xml") || lowerMime.contains("mpd") -> ".mpd"
+            lowerMime.contains("video/mp2t") || lowerUrl.contains(".ts") -> ".ts"
             lowerMime.contains("jpeg") || lowerMime.contains("jpg") || isSocialImage -> ".jpg"
             lowerMime.contains("png") -> ".png"
             lowerMime.contains("webp") -> ".webp"
             lowerMime.contains("gif") -> ".gif"
             lowerMime.contains("pdf") -> ".pdf"
-            lowerMime.contains("vnd.android.package-archive") || lowerMime.contains("apk") -> ".apk"
-            lowerMime.contains("zip") -> ".zip"
+            lowerMime.contains("vnd.android.package-archive") || lowerMime.contains("apk") || lowerUrl.contains(".apk") -> ".apk"
+            lowerMime.contains("zip") || lowerUrl.contains(".zip") -> ".zip"
+            lowerMime.contains("x-rar") || lowerMime.contains("rar") || lowerUrl.contains(".rar") -> ".rar"
+            lowerMime.contains("7z") || lowerUrl.contains(".7z") -> ".7z"
             lowerMime.contains("audio/mpeg") || lowerMime.contains("mp3") -> ".mp3"
             lowerMime.contains("audio/mp4") || lowerMime.contains("m4a") -> ".m4a"
             lowerUrl.contains("googlevideo.com") || lowerUrl.contains("videoplayback") -> ".mp4"
@@ -910,9 +939,13 @@ class MediaSniffer(
     private fun guessMimeType(fileName: String): String {
         val lower = fileName.lowercase()
         return when {
-            lower.endsWith(".mp4") -> "video/mp4"
+            lower.endsWith(".mp4") || lower.endsWith(".m4v") -> "video/mp4"
             lower.endsWith(".mkv") -> "video/x-matroska"
             lower.endsWith(".webm") -> "video/webm"
+            lower.endsWith(".m3u8") -> "application/vnd.apple.mpegurl"
+            lower.endsWith(".mpd") -> "application/dash+xml"
+            lower.endsWith(".ts") -> "video/mp2t"
+            lower.endsWith(".m4s") -> "video/iso.segment"
             lower.endsWith(".jpg") || lower.endsWith(".jpeg") -> "image/jpeg"
             lower.endsWith(".png") -> "image/png"
             lower.endsWith(".webp") -> "image/webp"
@@ -922,7 +955,9 @@ class MediaSniffer(
             lower.endsWith(".wav") -> "audio/wav"
             lower.endsWith(".pdf") -> "application/pdf"
             lower.endsWith(".zip") -> "application/zip"
-            lower.endsWith(".apk") -> "application/vnd.android.package-archive"
+            lower.endsWith(".rar") -> "application/x-rar-compressed"
+            lower.endsWith(".7z") -> "application/x-7z-compressed"
+            lower.endsWith(".apk") || lower.endsWith(".xapk") -> "application/vnd.android.package-archive"
             else -> "application/octet-stream"
         }
     }
@@ -938,7 +973,7 @@ class MediaSniffer(
     ): List<ExtractedMedia> = withContext(Dispatchers.IO) {
         val results = mutableListOf<ExtractedMedia>()
         val seenUrls = mutableSetOf<String>()
-        val effectiveHeaders = headerConfig ?: ChromeHeaderConfig()
+        val effectiveHeaders = media.headerConfig ?: headerConfig ?: ChromeHeaderConfig()
         val cleanMediaUrl = normalizeUrl(media.url)
         val cleanTitle = media.title.substringBefore(" - ").ifBlank { "Video" }
 
@@ -993,7 +1028,8 @@ class MediaSniffer(
                                             category = FileCategory.MEDIA,
                                             mimeType = "application/x-mpegURL",
                                             approxSize = if (bw > 0) (bw / 8) * 120 else -1L,
-                                            thumbnailUrl = media.thumbnailUrl
+                                            thumbnailUrl = media.thumbnailUrl,
+                                            headerConfig = effectiveHeaders
                                         )
                                     )
                                 }
@@ -1013,7 +1049,7 @@ class MediaSniffer(
         val pageToSniff = currentWebUrl?.takeIf { it.isNotBlank() && !it.startsWith("about:") }
         if (pageToSniff != null && results.isEmpty()) {
             try {
-                val sniffed = sniff(pageToSniff, headerConfig)
+                val sniffed = sniff(pageToSniff, effectiveHeaders)
                 val videoStreams = sniffed.filter {
                     it.category == FileCategory.MEDIA &&
                         (it.mimeType.startsWith("video/") || it.mimeType.startsWith("audio/") || it.url.contains("m3u8"))
@@ -1021,7 +1057,7 @@ class MediaSniffer(
                 for (stream in videoStreams) {
                     if (!seenUrls.contains(stream.url)) {
                         seenUrls.add(stream.url)
-                        results.add(stream)
+                        results.add(if (stream.headerConfig == null) stream.copy(headerConfig = effectiveHeaders) else stream)
                     }
                 }
             } catch (e: Exception) {
@@ -1054,7 +1090,8 @@ class MediaSniffer(
                                     category = FileCategory.MEDIA,
                                     mimeType = media.mimeType,
                                     approxSize = media.approxSize,
-                                    thumbnailUrl = media.thumbnailUrl
+                                    thumbnailUrl = media.thumbnailUrl,
+                                    headerConfig = effectiveHeaders
                                 )
                             )
                         } else {
@@ -1083,7 +1120,8 @@ class MediaSniffer(
                                         category = FileCategory.MEDIA,
                                         mimeType = media.mimeType,
                                         approxSize = foundSize,
-                                        thumbnailUrl = media.thumbnailUrl
+                                        thumbnailUrl = media.thumbnailUrl,
+                                        headerConfig = effectiveHeaders
                                     )
                                 )
                             }
@@ -1103,7 +1141,8 @@ class MediaSniffer(
                     category = FileCategory.MEDIA,
                     mimeType = media.mimeType,
                     approxSize = media.approxSize,
-                    thumbnailUrl = media.thumbnailUrl
+                    thumbnailUrl = media.thumbnailUrl,
+                    headerConfig = effectiveHeaders
                 )
             )
             results.add(
@@ -1113,7 +1152,8 @@ class MediaSniffer(
                     category = FileCategory.MEDIA,
                     mimeType = media.mimeType,
                     approxSize = if (media.approxSize > 0) (media.approxSize * 0.65).toLong() else -1L,
-                    thumbnailUrl = media.thumbnailUrl
+                    thumbnailUrl = media.thumbnailUrl,
+                    headerConfig = effectiveHeaders
                 )
             )
             results.add(
@@ -1123,7 +1163,8 @@ class MediaSniffer(
                     category = FileCategory.MEDIA,
                     mimeType = media.mimeType,
                     approxSize = if (media.approxSize > 0) (media.approxSize * 0.40).toLong() else -1L,
-                    thumbnailUrl = media.thumbnailUrl
+                    thumbnailUrl = media.thumbnailUrl,
+                    headerConfig = effectiveHeaders
                 )
             )
             results.add(
@@ -1133,7 +1174,8 @@ class MediaSniffer(
                     category = FileCategory.MEDIA,
                     mimeType = "audio/mp4",
                     approxSize = if (media.approxSize > 0) (media.approxSize * 0.15).toLong() else -1L,
-                    thumbnailUrl = media.thumbnailUrl
+                    thumbnailUrl = media.thumbnailUrl,
+                    headerConfig = effectiveHeaders
                 )
             )
         }
