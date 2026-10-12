@@ -1,6 +1,7 @@
 package com.example.data.engine
 
 import com.example.data.model.ChromeHeaderConfig
+import com.example.data.model.ChromePreset
 import com.example.data.model.ExtractedMedia
 import com.example.data.model.FileCategory
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +22,158 @@ class MediaSniffer(
     companion object {
         const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+        private val IMAGE_EXTENSIONS = listOf(".jpg", ".jpeg", ".png", ".webp", ".gif", ".ico", ".svg")
+
+        /**
+         * Detects whether a URL or MIME type represents an image/thumbnail.
+         * Used to strictly exclude images from video/media capture lists.
+         */
+        fun isImage(url: String, mimeType: String = ""): Boolean {
+            val lowerMime = mimeType.lowercase()
+            if (lowerMime.startsWith("image/") || lowerMime.contains("image/")) return true
+            val cleanUrl = url.substringBefore('?').substringBefore('#').lowercase()
+            return IMAGE_EXTENSIONS.any { cleanUrl.endsWith(it) }
+        }
+
+        /**
+         * Validates whether a resource qualifies as a genuine media stream or file.
+         * Only video/..., audio/..., .mp4, .mkv, .webm, .m3u8 (HLS), and .mpd (DASH)
+         * streams/files are considered valid media.
+         */
+        fun isValidMedia(url: String, mimeType: String = ""): Boolean {
+            if (isImage(url, mimeType)) return false
+            val lowerMime = mimeType.lowercase()
+            if (lowerMime.startsWith("video/") || lowerMime.startsWith("audio/")) return true
+            if (lowerMime.contains("mpegurl") || lowerMime.contains("dash+xml")) return true
+
+            val cleanUrl = url.substringBefore('?').substringBefore('#').lowercase()
+            val validExtensions = listOf(
+                ".mp4", ".mkv", ".webm", ".m3u8", ".mpd",
+                ".ts", ".m4s", ".m4v", ".mov", ".avi", ".flv",
+                ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac", ".opus"
+            )
+            if (validExtensions.any { cleanUrl.endsWith(it) }) return true
+
+            val fullLower = url.lowercase()
+            return fullLower.contains(".m3u8") || fullLower.contains(".mpd") || fullLower.contains("videoplayback") ||
+                fullLower.contains("/hls/") || fullLower.contains("/dash/") || fullLower.contains("playlist.m3u8") ||
+                fullLower.contains("master.m3u8") || fullLower.contains("format=m3u8") || fullLower.contains("format=dash")
+        }
+
+        /**
+         * Intercepts WebView WebResourceRequest to detect HLS (.m3u8) and DASH (.mpd) streaming manifests.
+         * Packages complete Cookie, User-Agent, Referer, and Origin headers into ChromeHeaderConfig.
+         */
+        fun interceptManifestRequest(
+            request: android.webkit.WebResourceRequest,
+            currentWebViewUrl: String? = null,
+            userAgentString: String? = null,
+            pageTitle: String = ""
+        ): ExtractedMedia? {
+            val reqUrl = request.url?.toString() ?: return null
+            return interceptManifestUrl(
+                reqUrl = reqUrl,
+                requestHeaders = request.requestHeaders ?: emptyMap(),
+                currentWebViewUrl = currentWebViewUrl,
+                userAgentString = userAgentString,
+                pageTitle = pageTitle
+            )
+        }
+
+        /**
+         * Parses and extracts streaming manifests (.m3u8 and .mpd) with full HTTP headers.
+         */
+        fun interceptManifestUrl(
+            reqUrl: String,
+            requestHeaders: Map<String, String> = emptyMap(),
+            currentWebViewUrl: String? = null,
+            userAgentString: String? = null,
+            pageTitle: String = ""
+        ): ExtractedMedia? {
+            val lower = reqUrl.lowercase()
+            val accept = requestHeaders["Accept"]?.lowercase().orEmpty()
+            val secDest = requestHeaders["Sec-Fetch-Dest"]?.lowercase().orEmpty()
+
+            val isHls = lower.contains(".m3u8") || lower.contains("format=m3u8") ||
+                lower.contains("/hls/") || lower.contains("playlist.m3u8") ||
+                lower.contains("master.m3u8") || accept.contains("mpegurl") ||
+                accept.contains("vnd.apple.mpegurl")
+
+            val isDash = lower.contains(".mpd") || lower.contains("format=dash") ||
+                lower.contains("/dash/") || lower.contains("manifest.mpd") ||
+                accept.contains("dash+xml")
+
+            if (!isHls && !isDash) return null
+
+            // 1. Resolve full Cookies
+            val cookieManager = try { android.webkit.CookieManager.getInstance() } catch (_: Exception) { null }
+            val cookieFromManager = try {
+                cookieManager?.getCookie(reqUrl) ?: currentWebViewUrl?.let { cookieManager?.getCookie(it) }
+            } catch (_: Exception) {
+                null
+            }
+            val cookieFromHeaders = requestHeaders["Cookie"] ?: requestHeaders["cookie"]
+            val effectiveCookie = listOfNotNull(cookieFromManager, cookieFromHeaders)
+                .filter { it.isNotBlank() }
+                .distinct()
+                .joinToString("; ")
+                .ifBlank { null }
+
+            // 2. User-Agent
+            val effectiveUserAgent = requestHeaders["User-Agent"]
+                ?: requestHeaders["user-agent"]
+                ?: userAgentString
+                ?: BROWSER_USER_AGENT
+
+            // 3. Referer
+            val effectiveReferer = requestHeaders["Referer"]
+                ?: requestHeaders["referer"]
+                ?: currentWebViewUrl
+                ?: reqUrl
+
+            // 4. Origin
+            val originFromHeaders = requestHeaders["Origin"] ?: requestHeaders["origin"]
+            val effectiveOrigin = originFromHeaders ?: try {
+                val refUri = java.net.URI(effectiveReferer)
+                val scheme = refUri.scheme ?: "https"
+                val host = refUri.host
+                if (!host.isNullOrBlank()) {
+                    val portStr = if (refUri.port != -1 && refUri.port != 80 && refUri.port != 443) ":${refUri.port}" else ""
+                    "$scheme://$host$portStr"
+                } else null
+            } catch (_: Exception) {
+                null
+            }
+
+            val extraHeaders = mutableMapOf<String, String>()
+            effectiveOrigin?.let { extraHeaders["Origin"] = it }
+            if (secDest.isNotBlank()) extraHeaders["Sec-Fetch-Dest"] = secDest
+            requestHeaders["Sec-Fetch-Mode"]?.let { extraHeaders["Sec-Fetch-Mode"] = it }
+            requestHeaders["Sec-Fetch-Site"]?.let { extraHeaders["Sec-Fetch-Site"] = it }
+
+            val headerConfig = ChromeHeaderConfig(
+                preset = ChromePreset.CUSTOM,
+                customUserAgent = effectiveUserAgent,
+                customReferer = effectiveReferer,
+                customCookies = effectiveCookie,
+                extraHeaders = extraHeaders
+            )
+
+            val mimeType = if (isHls) "application/vnd.apple.mpegurl" else "application/dash+xml"
+            val streamType = if (isHls) "HLS Akışı (M3U8)" else "DASH Akışı (MPD)"
+            val title = if (pageTitle.isNotBlank()) "$pageTitle - $streamType" else streamType
+
+            return ExtractedMedia(
+                url = reqUrl,
+                title = title,
+                category = FileCategory.MEDIA,
+                mimeType = mimeType,
+                approxSize = -1L,
+                thumbnailUrl = null,
+                headerConfig = headerConfig
+            )
+        }
     }
 
     suspend fun sniff(
@@ -28,7 +181,7 @@ class MediaSniffer(
         headerConfig: ChromeHeaderConfig? = null
     ): List<ExtractedMedia> = withContext(Dispatchers.IO) {
         val cleanUrl = normalizeUrl(rawUrl)
-        if (cleanUrl.isBlank()) return@withContext emptyList()
+        if (cleanUrl.isBlank() || isImage(cleanUrl)) return@withContext emptyList()
 
         val lowerUrl = cleanUrl.lowercase()
 
@@ -46,7 +199,7 @@ class MediaSniffer(
         if (lowerUrl.contains("youtube.com") || lowerUrl.contains("youtu.be")) {
             val ytResults = resolveYouTube(cleanUrl, effectiveHeaders)
             if (ytResults.isNotEmpty()) {
-                return@withContext ytResults
+                return@withContext ytResults.filterNot { isImage(it.url, it.mimeType) }
             }
         }
 
@@ -54,7 +207,7 @@ class MediaSniffer(
         if (lowerUrl.contains("instagram.com")) {
             val igResults = resolveInstagram(cleanUrl, effectiveHeaders)
             if (igResults.isNotEmpty()) {
-                return@withContext igResults
+                return@withContext igResults.filterNot { isImage(it.url, it.mimeType) }
             }
         }
 
@@ -62,7 +215,7 @@ class MediaSniffer(
         if (lowerUrl.contains("twitter.com") || lowerUrl.contains("x.com")) {
             val twResults = resolveTwitter(cleanUrl, effectiveHeaders)
             if (twResults.isNotEmpty()) {
-                return@withContext twResults
+                return@withContext twResults.filterNot { isImage(it.url, it.mimeType) }
             }
         }
 
@@ -76,7 +229,7 @@ class MediaSniffer(
                 category = category,
                 mimeType = guessMimeType(fileName),
                 approxSize = -1L,
-                thumbnailUrl = if (category == FileCategory.MEDIA && (fileName.endsWith(".jpg", true) || fileName.endsWith(".png", true))) cleanUrl else null,
+                thumbnailUrl = null,
                 headerConfig = effectiveHeaders
             )
             return@withContext try {
@@ -88,21 +241,34 @@ class MediaSniffer(
                 val contentLength = response.header("Content-Length")?.toLongOrNull() ?: -1L
                 val contentDisposition = response.header("Content-Disposition").orEmpty()
                 response.close()
-                val probedName = extractFileName(finalUrl, contentDisposition, contentType)
-                val probedCategory = FileCategory.detect(probedName, contentType)
-                listOf(
-                    ExtractedMedia(
-                        url = finalUrl,
-                        title = probedName,
-                        category = probedCategory,
-                        mimeType = contentType.ifBlank { directItem.mimeType },
-                        approxSize = contentLength,
-                        thumbnailUrl = directItem.thumbnailUrl,
-                        headerConfig = effectiveHeaders
-                    )
-                )
+
+                if (isImage(finalUrl, contentType)) {
+                    emptyList()
+                } else {
+                    val probedName = extractFileName(finalUrl, contentDisposition, contentType)
+                    val probedCategory = FileCategory.detect(probedName, contentType)
+                    if (probedCategory == FileCategory.MEDIA && !isValidMedia(finalUrl, contentType)) {
+                        emptyList()
+                    } else {
+                        listOf(
+                            ExtractedMedia(
+                                url = finalUrl,
+                                title = probedName,
+                                category = probedCategory,
+                                mimeType = contentType.ifBlank { directItem.mimeType },
+                                approxSize = contentLength,
+                                thumbnailUrl = null,
+                                headerConfig = effectiveHeaders
+                            )
+                        )
+                    }
+                }
             } catch (e: Exception) {
-                listOf(directItem)
+                if (category == FileCategory.MEDIA && !isValidMedia(cleanUrl, directItem.mimeType)) {
+                    emptyList()
+                } else {
+                    listOf(directItem)
+                }
             }
         }
 
@@ -117,10 +283,14 @@ class MediaSniffer(
             val contentLength = response.header("Content-Length")?.toLongOrNull() ?: -1L
             val contentDisposition = response.header("Content-Disposition").orEmpty()
 
+            if (isImage(finalUrl, contentType)) {
+                response.close()
+                return@withContext emptyList()
+            }
+
             // If it's directly a downloadable media file (not HTML)
             val isDirectMedia = !contentType.contains("text/html") && (
                 contentType.startsWith("video/") ||
-                    contentType.startsWith("image/") ||
                     contentType.startsWith("audio/") ||
                     contentType.startsWith("application/") ||
                     hasMediaExtension(finalUrl)
@@ -130,6 +300,9 @@ class MediaSniffer(
                 response.close()
                 val fileName = extractFileName(finalUrl, contentDisposition, contentType)
                 val category = FileCategory.detect(fileName, contentType)
+                if (category == FileCategory.MEDIA && !isValidMedia(finalUrl, contentType)) {
+                    return@withContext emptyList()
+                }
                 return@withContext listOf(
                     ExtractedMedia(
                         url = finalUrl,
@@ -137,7 +310,7 @@ class MediaSniffer(
                         category = category,
                         mimeType = contentType.ifBlank { "application/octet-stream" },
                         approxSize = contentLength,
-                        thumbnailUrl = if (category == FileCategory.MEDIA && contentType.startsWith("image/")) finalUrl else null,
+                        thumbnailUrl = null,
                         headerConfig = effectiveHeaders
                     )
                 )
@@ -148,7 +321,7 @@ class MediaSniffer(
             response.close()
 
             val extracted = parseHtml(finalUrl, responseBody, effectiveHeaders)
-            return@withContext extracted
+            return@withContext extracted.filterNot { isImage(it.url, it.mimeType) }
         } catch (e: Exception) {
             e.printStackTrace()
             return@withContext emptyList()
@@ -326,19 +499,6 @@ class MediaSniffer(
             }
         }
 
-        // 4. Always include HD Video thumbnail as downloadable media
-        results.add(
-            ExtractedMedia(
-                url = "https://i.ytimg.com/vi/$videoId/maxresdefault.jpg",
-                title = "$baseTitle - Kapak Fotoğrafı (HD JPG)",
-                category = FileCategory.MEDIA,
-                mimeType = "image/jpeg",
-                approxSize = -1L,
-                thumbnailUrl = displayThumb,
-                headerConfig = effectiveHeaders
-            )
-        )
-
         results
     }
 
@@ -415,6 +575,8 @@ class MediaSniffer(
         val effectiveHeaders = headerConfig ?: ChromeHeaderConfig(customReferer = "https://www.instagram.com/")
 
         fun addMedia(mediaUrl: String, title: String, mime: String, thumb: String? = null) {
+            if (isImage(mediaUrl, mime)) return
+            if (!isValidMedia(mediaUrl, mime)) return
             val cleanMedia = mediaUrl.replace("\\/", "/").replace("&amp;", "&").replace("\\u0026", "&").trim()
             if (cleanMedia.isBlank() || seenUrls.contains(cleanMedia)) return
             seenUrls.add(cleanMedia)
@@ -425,7 +587,7 @@ class MediaSniffer(
                     category = FileCategory.MEDIA,
                     mimeType = mime,
                     approxSize = -1L,
-                    thumbnailUrl = thumb ?: if (mime.startsWith("image/")) cleanMedia else null,
+                    thumbnailUrl = thumb,
                     headerConfig = effectiveHeaders
                 )
             )
@@ -457,14 +619,6 @@ class MediaSniffer(
                 val found = mp4Matcher.group(0).orEmpty()
                 addMedia(found, "Instagram Reel - $shortcode (MP4)", "video/mp4")
             }
-
-            // Look for display_url (HD image / cover)
-            val displayUrlPattern = Pattern.compile("""(?:display_url|displayUrl)["']?\s*:\s*["'](https://[^"']+)["']""", Pattern.CASE_INSENSITIVE)
-            val displayMatcher = displayUrlPattern.matcher(cleanHtml)
-            while (displayMatcher.find()) {
-                val found = displayMatcher.group(1).orEmpty()
-                addMedia(found, "Instagram Fotoğraf - $shortcode (JPG)", "image/jpeg", found)
-            }
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -491,13 +645,6 @@ class MediaSniffer(
                             addMedia(bestVideo, "Instagram Video - $shortcode (MP4)", "video/mp4")
                         }
                     }
-                    val imageVersions = item.optJSONObject("image_versions2")?.optJSONArray("candidates")
-                    if (imageVersions != null && imageVersions.length() > 0) {
-                        val bestImg = imageVersions.optJSONObject(0)?.optString("url")
-                        if (!bestImg.isNullOrBlank()) {
-                            addMedia(bestImg, "Instagram Kapak - $shortcode (JPG)", "image/jpeg", bestImg)
-                        }
-                    }
                 }
             }
             resp.close()
@@ -518,10 +665,6 @@ class MediaSniffer(
                 val ogVideoMatcher = Pattern.compile("""<meta[^>]+property=["']og:video(?::(?:url|secure_url))?["'][^>]+content=["']([^"']+)["']""", Pattern.CASE_INSENSITIVE).matcher(cHtml)
                 while (ogVideoMatcher.find()) {
                     ogVideoMatcher.group(1)?.let { addMedia(it, "Instagram Video - $shortcode (MP4)", "video/mp4") }
-                }
-                val ogImgMatcher = Pattern.compile("""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']""", Pattern.CASE_INSENSITIVE).matcher(cHtml)
-                while (ogImgMatcher.find()) {
-                    ogImgMatcher.group(1)?.let { addMedia(it, "Instagram Fotoğraf - $shortcode (JPG)", "image/jpeg", it) }
                 }
             }
             crawlerResp.close()
@@ -582,26 +725,6 @@ class MediaSniffer(
                             }
                         }
                     }
-                    val photos = media?.optJSONArray("photos")
-                    if (photos != null) {
-                        for (i in 0 until photos.length()) {
-                            val p = photos.optJSONObject(i) ?: continue
-                            val pUrl = p.optString("url")
-                            if (pUrl.isNotBlank()) {
-                                results.add(
-                                    ExtractedMedia(
-                                        url = pUrl,
-                                        title = "X/Twitter Fotoğraf - ${tweetId}_${i + 1}.jpg",
-                                        category = FileCategory.MEDIA,
-                                        mimeType = "image/jpeg",
-                                        approxSize = -1L,
-                                        thumbnailUrl = pUrl,
-                                        headerConfig = effectiveHeaders
-                                    )
-                                )
-                            }
-                        }
-                    }
                 }
             }
             resp.close()
@@ -643,12 +766,17 @@ class MediaSniffer(
             val resolvedUrl = resolveUrl(baseHttpUrl, cleanTarget) ?: return
             if (seenUrls.contains(resolvedUrl)) return
             if (resolvedUrl.startsWith("data:") || resolvedUrl.startsWith("javascript:")) return
+            if (isImage(resolvedUrl)) return
 
             val fileName = extractFileName(resolvedUrl, "", "")
+            val guessedMime = guessMimeType(fileName)
+            if (isImage(resolvedUrl, guessedMime)) return
+
             val category = forcedCategory ?: FileCategory.detect(fileName, "")
 
-            // Ignore 1x1 tracking pixels, common ad icons, SVG favicons
+            // Strictly validate media streams (exclude tracking pixels, icons, images)
             if (category == FileCategory.MEDIA) {
+                if (!isValidMedia(resolvedUrl, guessedMime)) return
                 val lowerName = fileName.lowercase()
                 if (lowerName.contains("pixel") || lowerName.contains("tracker") ||
                     lowerName.contains("blank") || lowerName.contains("1x1") ||
@@ -665,15 +793,15 @@ class MediaSniffer(
                     url = resolvedUrl,
                     title = displayTitle,
                     category = category,
-                    mimeType = guessMimeType(fileName),
+                    mimeType = guessedMime,
                     approxSize = -1L,
-                    thumbnailUrl = if (category == FileCategory.MEDIA) resolvedUrl else null,
+                    thumbnailUrl = null,
                     headerConfig = effectiveHeaders
                 )
             )
         }
 
-        // 1. OpenGraph & Twitter Meta Tags (high confidence video & image URLs on modern web!)
+        // 1. OpenGraph & Twitter Meta Tags (high confidence video URLs on modern web!)
         val ogVideoRegex = Pattern.compile("""<meta[^>]+property=["']og:video(?::(?:url|secure_url))?["'][^>]+content=["']([^"']+)["']""", Pattern.CASE_INSENSITIVE)
         val ogVideoMatcher = ogVideoRegex.matcher(html)
         while (ogVideoMatcher.find()) {
@@ -684,12 +812,6 @@ class MediaSniffer(
         val twitterVideoMatcher = twitterVideoRegex.matcher(html)
         while (twitterVideoMatcher.find()) {
             twitterVideoMatcher.group(1)?.let { addIfValid(it, title = pageTitle, forcedCategory = FileCategory.MEDIA) }
-        }
-
-        val ogImageRegex = Pattern.compile("""<meta[^>]+(?:property=["']og:image(?::(?:url|secure_url))?["']|name=["']twitter:image["'])[^>]+content=["']([^"']+)["']""", Pattern.CASE_INSENSITIVE)
-        val ogImageMatcher = ogImageRegex.matcher(html)
-        while (ogImageMatcher.find()) {
-            ogImageMatcher.group(1)?.let { addIfValid(it, title = pageTitle, forcedCategory = FileCategory.MEDIA) }
         }
 
         // 2. HTML5 Video elements & Source tags
@@ -706,25 +828,7 @@ class MediaSniffer(
             audioMatcher.group(1)?.let { addIfValid(it, forcedCategory = FileCategory.MEDIA) }
         }
 
-        // 4. HTML5 Images (including lazy-load attributes & srcset)
-        val imgRegex = Pattern.compile("""<img[^>]+(?:src|data-src|data-original|data-lazy-src|data-zoom-image)=["']([^"']+)["'][^>]*>""", Pattern.CASE_INSENSITIVE)
-        val imgMatcher = imgRegex.matcher(html)
-        while (imgMatcher.find()) {
-            imgMatcher.group(1)?.let { addIfValid(it, forcedCategory = FileCategory.MEDIA) }
-        }
-
-        // Extract from srcset (takes highest resolution link)
-        val srcsetRegex = Pattern.compile("""srcset=["']([^"']+)["']""", Pattern.CASE_INSENSITIVE)
-        val srcsetMatcher = srcsetRegex.matcher(html)
-        while (srcsetMatcher.find()) {
-            val srcset = srcsetMatcher.group(1) ?: continue
-            val candidate = srcset.split(",").lastOrNull()?.trim()?.substringBefore(" ")
-            if (!candidate.isNullOrBlank()) {
-                addIfValid(candidate, forcedCategory = FileCategory.MEDIA)
-            }
-        }
-
-        // 5. JavaScript video player variables (JWPlayer, Video.js, Plyr, Clappr, HLS.js, DPlayer)
+        // 4. JavaScript video player variables (JWPlayer, Video.js, Plyr, Clappr, HLS.js, DPlayer)
         val jsPlayerRegex = Pattern.compile("""(?:file|source|src|videoUrl|video_url|downloadUrl|download_url|hls)\s*:\s*["']([^"']+)["']""", Pattern.CASE_INSENSITIVE)
         val jsPlayerMatcher = jsPlayerRegex.matcher(html)
         while (jsPlayerMatcher.find()) {
@@ -734,7 +838,7 @@ class MediaSniffer(
             }
         }
 
-        // 6. Anchor links & Download buttons on web pages
+        // 5. Anchor links & Download buttons on web pages
         val anchorRegex = Pattern.compile("""<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>""", Pattern.CASE_INSENSITIVE or Pattern.DOTALL)
         val anchorMatcher = anchorRegex.matcher(html)
         while (anchorMatcher.find()) {
@@ -755,7 +859,7 @@ class MediaSniffer(
             }
         }
 
-        // 7. Direct CDN stream scanner: GoogleVideo, Instagram, TikTok, FB, m3u8, mpd, mp4, apk, zip
+        // 6. Direct CDN stream scanner: GoogleVideo, Instagram, TikTok, FB, m3u8, mpd, mp4, apk, zip
         val streamRegex = Pattern.compile("""https?(?::|%3A)(?:\\/\\/|//)[^"'\s<>\\]+?(?:\.googlevideo\.com/videoplayback|\.cdninstagram\.com/|\.tiktokcdn\.com/|\.fbcdn\.net/|\.m3u8|\.mpd|\.mp4|\.webm|\.mkv|\.apk|\.xapk|\.zip|\.rar|\.7z)[^"'\s<>\\]*""", Pattern.CASE_INSENSITIVE)
         val streamMatcher = streamRegex.matcher(html)
         var streamCount = 0
@@ -771,8 +875,8 @@ class MediaSniffer(
             streamCount++
         }
 
-        // 8. Inline JavaScript / JSON Stream Scanner
-        val inlineMediaRegex = Pattern.compile("""https?(?::|%3A)(?:\\/\\/|//)[^"'\s<>\\]+?\.(?:mp4|mkv|webm|mov|m3u8|mpd|ts|m4s|mp3|wav|ogg|aac|flac|jpg|jpeg|png|webp|gif|pdf|zip|rar|7z|apk|xapk)(?:\?[^"'\s<>\\]*)?""", Pattern.CASE_INSENSITIVE)
+        // 7. Inline JavaScript / JSON Stream Scanner (video & audio streams only)
+        val inlineMediaRegex = Pattern.compile("""https?(?::|%3A)(?:\\/\\/|//)[^"'\s<>\\]+?\.(?:mp4|mkv|webm|mov|m3u8|mpd|ts|m4s|mp3|wav|ogg|aac|flac|pdf|zip|rar|7z|apk|xapk)(?:\?[^"'\s<>\\]*)?""", Pattern.CASE_INSENSITIVE)
         val inlineMatcher = inlineMediaRegex.matcher(html)
         var inlineCount = 0
         while (inlineMatcher.find() && inlineCount < 40) {
@@ -781,7 +885,7 @@ class MediaSniffer(
             inlineCount++
         }
 
-        // 9. Video iframe inspection for movie/series/embed sites
+        // 8. Video iframe inspection for movie/series/embed sites
         val iframeRegex = Pattern.compile("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""", Pattern.CASE_INSENSITIVE)
         val iframeMatcher = iframeRegex.matcher(html)
         val videoIframeCandidates = mutableListOf<String>()
@@ -813,7 +917,7 @@ class MediaSniffer(
         }
 
         // Sort: APKS first, then MEDIA, ARCHIVES, DOCUMENTS, Others
-        return results.sortedBy { media ->
+        return results.filterNot { isImage(it.url, it.mimeType) }.sortedBy { media ->
             when (media.category) {
                 FileCategory.APKS -> 0
                 FileCategory.MEDIA -> 1
@@ -858,10 +962,10 @@ class MediaSniffer(
     }
 
     private fun hasMediaExtension(url: String): Boolean {
+        if (isImage(url)) return false
         val clean = url.substringBefore('?').substringBefore('#').lowercase()
         val extensions = listOf(
             ".mp4", ".mkv", ".webm", ".avi", ".mov", ".3gp", ".flv",
-            ".jpg", ".jpeg", ".png", ".webp", ".gif",
             ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a",
             ".pdf", ".zip", ".rar", ".7z", ".apk", ".xapk", ".apks", ".tar", ".gz",
             ".docx", ".xlsx", ".pptx", ".iso", ".exe", ".dmg",

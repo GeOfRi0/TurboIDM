@@ -92,6 +92,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.engine.MediaSniffer
 import com.example.data.engine.OkHttpProvider
 import com.example.data.model.ChromeHeaderConfig
 import com.example.data.model.ChromePreset
@@ -394,6 +395,7 @@ fun WebSnifferBrowserScreen(
 
                         // Intercept direct file downloads (APK, ZIP, MP4, etc.)
                         setDownloadListener { downloadUrl, userAgent, contentDisposition, mimetype, _ ->
+                            if (MediaSniffer.isImage(downloadUrl, mimetype.orEmpty())) return@setDownloadListener
                             val cookieManager = CookieManager.getInstance()
                             val cookies = try {
                                 cookieManager.getCookie(downloadUrl) ?: cookieManager.getCookie(url)
@@ -438,7 +440,7 @@ fun WebSnifferBrowserScreen(
                             }
                         }
 
-                        // JavaScript Interface to catch HTML5 video events, XHR/fetch streams, and download links
+                        // JavaScript Interface to catch HTML5 video events (play, loadeddata, src changes), XHR/fetch streams, and download links
                         addJavascriptInterface(
                             object {
                                 @JavascriptInterface
@@ -448,7 +450,19 @@ fun WebSnifferBrowserScreen(
 
                                 @JavascriptInterface
                                 fun onMediaDetectedWithDetails(url: String, title: String, mimeType: String) {
-                                    if (url.isBlank() || url.startsWith("blob:") || url.startsWith("data:")) return
+                                    handleDetectedMedia(url, title, mimeType)
+                                }
+
+                                @JavascriptInterface
+                                fun onVideoPlayed(url: String, title: String, mimeType: String) {
+                                    handleDetectedMedia(url, title, mimeType)
+                                }
+
+                                private fun handleDetectedMedia(url: String, title: String, mimeType: String) {
+                                    if (url.isBlank() || url.startsWith("blob:", ignoreCase = true) || url.startsWith("data:", ignoreCase = true)) return
+                                    if (MediaSniffer.isImage(url, mimeType)) return
+                                    if (!MediaSniffer.isValidMedia(url, mimeType) && !url.contains(".apk", true) && !url.contains(".zip", true)) return
+
                                     post {
                                         val cookieManager = CookieManager.getInstance()
                                         val currentWvUrl = this@apply.url
@@ -461,11 +475,27 @@ fun WebSnifferBrowserScreen(
                                         val ua = this@apply.settings.userAgentString.ifBlank {
                                             if (isDesktopMode) DESKTOP_CHROME_USER_AGENT else ChromePreset.CHROME_ANDROID.userAgent
                                         }
+                                        val origin = try {
+                                            val refUri = java.net.URI(referer)
+                                            val scheme = refUri.scheme ?: "https"
+                                            val host = refUri.host
+                                            if (!host.isNullOrBlank()) {
+                                                val portStr = if (refUri.port != -1 && refUri.port != 80 && refUri.port != 443) ":${refUri.port}" else ""
+                                                "$scheme://$host$portStr"
+                                            } else null
+                                        } catch (_: Exception) {
+                                            null
+                                        }
+
+                                        val extraHeaders = mutableMapOf<String, String>()
+                                        origin?.let { extraHeaders["Origin"] = it }
+
                                         val headerConfig = ChromeHeaderConfig(
                                             preset = ChromePreset.CUSTOM,
                                             customUserAgent = ua,
                                             customReferer = referer,
-                                            customCookies = cookie
+                                            customCookies = cookie,
+                                            extraHeaders = extraHeaders
                                         )
 
                                         val resolvedMime = when {
@@ -513,6 +543,8 @@ fun WebSnifferBrowserScreen(
                                     canGoBack = view?.canGoBack() == true
                                     canGoForward = view?.canGoForward() == true
                                 }
+                                // Inject media sniffer early so initial play and load events are captured
+                                view?.evaluateJavascript(INJECTED_MEDIA_SNIFFER_JS, null)
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
@@ -536,25 +568,39 @@ fun WebSnifferBrowserScreen(
                                 val headers = request.requestHeaders ?: emptyMap()
                                 val lower = reqUrl.lowercase()
 
-                                // Exclude static assets
-                                val isStaticAsset = (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") ||
-                                    lower.endsWith(".gif") || lower.endsWith(".svg") || lower.endsWith(".webp") ||
-                                    lower.endsWith(".css") || lower.endsWith(".js") || lower.endsWith(".woff") ||
-                                    lower.endsWith(".woff2") || lower.endsWith(".ttf") || lower.endsWith(".ico") ||
-                                    lower.contains("/analytics") || lower.contains("/pixel") || lower.contains("/telemetry") ||
-                                    lower.contains("google-analytics.com") || lower.contains("googletagmanager.com")) &&
-                                    !lower.contains("videoplayback") && !lower.contains(".m3u8") && !lower.contains(".mpd") &&
-                                    !lower.contains(".mp4") && !lower.contains(".apk") && !lower.contains(".zip")
-
-                                if (isStaticAsset) {
+                                // Exclude all image requests (Requirement 1)
+                                if (MediaSniffer.isImage(reqUrl)) {
                                     return super.shouldInterceptRequest(view, request)
                                 }
 
-                                // Exclude Instagram photos
-                                val isInstagramPhoto = lower.contains("cdninstagram.com") &&
-                                    (lower.contains("t51.") || lower.contains("dst-jpg") || lower.contains(".jpg") || lower.contains(".webp") || lower.contains(".png"))
+                                // 1. HLS (.m3u8) & DASH (.mpd) Manifest Interceptor with complete headers (Requirement 3)
+                                val manifestMedia = MediaSniffer.interceptManifestRequest(
+                                    request = request,
+                                    currentWebViewUrl = view?.url ?: urlInputText,
+                                    userAgentString = view?.settings?.userAgentString,
+                                    pageTitle = pageTitle
+                                )
+                                if (manifestMedia != null) {
+                                    post {
+                                        viewModel.addCapturedMedia(
+                                            url = manifestMedia.url,
+                                            title = manifestMedia.title,
+                                            mimeType = manifestMedia.mimeType,
+                                            headerConfig = manifestMedia.headerConfig
+                                        )
+                                    }
+                                    return super.shouldInterceptRequest(view, request)
+                                }
 
-                                if (isInstagramPhoto) {
+                                // Exclude static assets
+                                val isStaticAsset = (lower.endsWith(".css") || lower.endsWith(".js") || lower.endsWith(".woff") ||
+                                    lower.endsWith(".woff2") || lower.endsWith(".ttf") || lower.endsWith(".ico") ||
+                                    lower.contains("/analytics") || lower.contains("/pixel") || lower.contains("/telemetry") ||
+                                    lower.contains("google-analytics.com") || lower.contains("googletagmanager.com")) &&
+                                    !lower.contains("videoplayback") && !lower.contains(".mp4") &&
+                                    !lower.contains(".apk") && !lower.contains(".zip")
+
+                                if (isStaticAsset) {
                                     return super.shouldInterceptRequest(view, request)
                                 }
 
@@ -577,20 +623,16 @@ fun WebSnifferBrowserScreen(
                                     accept.contains("application/x-zip")
 
                                 // Direct video/media stream detection (applies to both main frame and iframe requests)
-                                val isDirectVideoStream = (lower.contains(".mp4") || lower.contains(".m3u8") ||
-                                    lower.contains(".webm") || lower.contains(".ts") || lower.contains(".mpd") ||
-                                    lower.contains(".m4s") || lower.contains(".m4v") || lower.contains(".mov") ||
-                                    lower.contains(".flv") || lower.contains(".f4v") || lower.contains(".mkv") ||
-                                    lower.contains(".mp3") || lower.contains(".m4a") || lower.contains(".aac") ||
-                                    lower.contains(".wav") || lower.contains(".ogg") || lower.contains(".flac") || lower.contains(".opus") ||
+                                val isDirectVideoStream = (lower.contains(".mp4") || lower.contains(".webm") ||
+                                    lower.contains(".ts") || lower.contains(".m4s") || lower.contains(".m4v") ||
+                                    lower.contains(".mov") || lower.contains(".flv") || lower.contains(".f4v") ||
+                                    lower.contains(".mkv") || lower.contains(".mp3") || lower.contains(".m4a") ||
+                                    lower.contains(".aac") || lower.contains(".wav") || lower.contains(".ogg") ||
+                                    lower.contains(".flac") || lower.contains(".opus") ||
                                     lower.contains("videoplayback") || (lower.contains("cdninstagram.com") && lower.contains("t50.")) ||
-                                    lower.contains("/hls/") || lower.contains("/dash/") || lower.contains("playlist.m3u8") ||
-                                    lower.contains("master.m3u8") || lower.contains("chunklist") || lower.contains("manifest.mpd") ||
-                                    lower.contains("mime=video") || lower.contains("format=m3u8") || lower.contains("format=dash") ||
-                                    lower.contains("type=video") || isMediaHeader)
+                                    lower.contains("mime=video") || lower.contains("type=video") || isMediaHeader)
 
                                 // Subframe / iframe embed request detection
-                                // CRITICAL: Intercept all iframe (subframe) requests to capture embedded players!
                                 val isIframeRequest = !isForMainFrame || secDest == "iframe" || secDest == "frame"
                                 val isIframeEmbed = isIframeRequest && (
                                     lower.contains("youtube.com/embed") || lower.contains("youtu.be/") ||
@@ -615,9 +657,21 @@ fun WebSnifferBrowserScreen(
                                 val effectiveReferer = headers["Referer"] ?: headers["referer"] ?: view?.url ?: urlInputText
                                 val effectiveUserAgent = headers["User-Agent"] ?: headers["user-agent"] ?: view?.settings?.userAgentString ?: if (isDesktopMode) DESKTOP_CHROME_USER_AGENT else ChromePreset.CHROME_ANDROID.userAgent
 
+                                val originFromHeaders = headers["Origin"] ?: headers["origin"]
+                                val effectiveOrigin = originFromHeaders ?: try {
+                                    val refUri = java.net.URI(effectiveReferer)
+                                    val scheme = refUri.scheme ?: "https"
+                                    val host = refUri.host
+                                    if (!host.isNullOrBlank()) {
+                                        val portStr = if (refUri.port != -1 && refUri.port != 80 && refUri.port != 443) ":${refUri.port}" else ""
+                                        "$scheme://$host$portStr"
+                                    } else null
+                                } catch (_: Exception) {
+                                    null
+                                }
+
                                 val extraHeaders = mutableMapOf<String, String>()
-                                headers["Origin"]?.let { extraHeaders["Origin"] = it }
-                                headers["origin"]?.let { extraHeaders["Origin"] = it }
+                                effectiveOrigin?.let { extraHeaders["Origin"] = it }
                                 headers["Sec-Fetch-Dest"]?.let { extraHeaders["Sec-Fetch-Dest"] = it }
                                 headers["Sec-Fetch-Mode"]?.let { extraHeaders["Sec-Fetch-Mode"] = it }
                                 headers["Sec-Fetch-Site"]?.let { extraHeaders["Sec-Fetch-Site"] = it }
@@ -638,9 +692,11 @@ fun WebSnifferBrowserScreen(
                                         reqUrl
                                     }
 
+                                    if (MediaSniffer.isImage(cleanStreamUrl)) {
+                                        return super.shouldInterceptRequest(view, request)
+                                    }
+
                                     val mime = when {
-                                        lower.contains(".m3u8") || lower.contains("format=m3u8") || accept.contains("mpegurl") -> "application/vnd.apple.mpegurl"
-                                        lower.contains(".mpd") || lower.contains("format=dash") || accept.contains("dash+xml") -> "application/dash+xml"
                                         isApkOrZip && (lower.contains(".apk") || accept.contains("package")) -> "application/vnd.android.package-archive"
                                         isApkOrZip -> "application/zip"
                                         lower.contains(".webm") -> "video/webm"
@@ -675,12 +731,6 @@ fun WebSnifferBrowserScreen(
                                         lower.contains("instagram.com") || lower.contains("cdninstagram.com") -> {
                                             "Instagram Video - ${pageTitle.ifBlank { "Reel" }}"
                                         }
-                                        lower.contains(".mpd") -> {
-                                            "DASH Akışı (MPD) - ${pageTitle.ifBlank { "Video" }}"
-                                        }
-                                        lower.contains(".m3u8") -> {
-                                            "HLS Akışı (M3U8) - ${pageTitle.ifBlank { "Video" }}"
-                                        }
                                         else -> pageTitle.ifBlank { "Web Medya Akışı" }
                                     }
 
@@ -709,9 +759,10 @@ fun WebSnifferBrowserScreen(
                                             val resp = OkHttpProvider.client.newCall(probeBuilder.build()).execute()
                                             val cType = resp.header("Content-Type").orEmpty().lowercase()
                                             resp.close()
-                                            if (cType.contains("video/") || cType.contains("audio/") ||
+                                            if (!MediaSniffer.isImage(reqUrl, cType) && (
+                                                cType.contains("video/") || cType.contains("audio/") ||
                                                 cType.contains("mpegurl") || cType.contains("dash+xml") ||
-                                                cType.contains("vnd.android.package-archive") || cType.contains("zip")) {
+                                                cType.contains("vnd.android.package-archive") || cType.contains("zip"))) {
                                                 post {
                                                     viewModel.addCapturedMedia(
                                                         url = reqUrl,
@@ -734,9 +785,29 @@ fun WebSnifferBrowserScreen(
                                 url: String?
                             ): WebResourceResponse? {
                                 val reqUrl = url ?: return null
+                                if (MediaSniffer.isImage(reqUrl)) return super.shouldInterceptRequest(view, url)
+
+                                val manifestMedia = MediaSniffer.interceptManifestUrl(
+                                    reqUrl = reqUrl,
+                                    currentWebViewUrl = view?.url ?: urlInputText,
+                                    userAgentString = view?.settings?.userAgentString,
+                                    pageTitle = pageTitle
+                                )
+                                if (manifestMedia != null) {
+                                    post {
+                                        viewModel.addCapturedMedia(
+                                            url = manifestMedia.url,
+                                            title = manifestMedia.title,
+                                            mimeType = manifestMedia.mimeType,
+                                            headerConfig = manifestMedia.headerConfig
+                                        )
+                                    }
+                                    return super.shouldInterceptRequest(view, url)
+                                }
+
                                 val lower = reqUrl.lowercase()
-                                if (lower.contains(".mp4") || lower.contains(".m3u8") || lower.contains(".mpd") ||
-                                    lower.contains(".apk") || lower.contains(".zip") || lower.contains("videoplayback") || lower.contains(".webm")) {
+                                if (lower.contains(".mp4") || lower.contains(".apk") || lower.contains(".zip") ||
+                                    lower.contains("videoplayback") || lower.contains(".webm")) {
                                     val cookieManager = CookieManager.getInstance()
                                     val cookie = try { cookieManager.getCookie(reqUrl) ?: view?.url?.let { cookieManager.getCookie(it) } } catch (e: Exception) { null }
                                     val referer = view?.url ?: urlInputText
@@ -748,10 +819,9 @@ fun WebSnifferBrowserScreen(
                                         customCookies = cookie
                                     )
                                     val mime = when {
-                                        lower.contains(".m3u8") -> "application/vnd.apple.mpegurl"
-                                        lower.contains(".mpd") -> "application/dash+xml"
                                         lower.contains(".apk") -> "application/vnd.android.package-archive"
                                         lower.contains(".zip") -> "application/zip"
+                                        lower.contains(".webm") -> "video/webm"
                                         else -> "video/mp4"
                                     }
                                     post {
@@ -1156,29 +1226,211 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
         return null;
     }
 
-    function notifyMediaWithMime(src, title, mime, win) {
-        if (!src) return;
+    function isImageCandidate(url) {
+        if (!url || typeof url !== 'string') return true;
+        var clean = url.split('?')[0].split('#')[0].toLowerCase();
+        return clean.endsWith('.jpg') || clean.endsWith('.jpeg') || clean.endsWith('.png') ||
+               clean.endsWith('.webp') || clean.endsWith('.gif') || clean.endsWith('.ico') ||
+               clean.endsWith('.svg');
+    }
+
+    function notifyMediaCandidate(src, title, mime, win) {
+        if (!src || typeof src !== 'string') return;
         src = src.trim();
-        if (src.startsWith('http') && !src.startsWith('blob:') && !src.startsWith('data:') &&
-            !src.includes('analytics') && !src.includes('pixel') && !src.includes('favicon')) {
-            var sniffer = getSniffer(win || window);
-            if (sniffer) {
-                try {
-                    if (sniffer.onMediaDetectedWithDetails) {
-                        sniffer.onMediaDetectedWithDetails(src, title || document.title || 'Medya', mime || '');
-                    } else if (sniffer.onMediaDetected) {
-                        sniffer.onMediaDetected(src, title || document.title || 'Medya');
-                    }
-                } catch(e) {}
-            }
+        if (src.startsWith('//')) {
+            src = window.location.protocol + src;
+        } else if (src.startsWith('/')) {
+            src = window.location.origin + src;
+        }
+        if (!src.startsWith('http://') && !src.startsWith('https://')) return;
+        if (src.startsWith('blob:') || src.startsWith('data:')) return;
+        if (isImageCandidate(src)) return;
+        if (src.includes('analytics') || src.includes('pixel') || src.includes('favicon')) return;
+
+        var sniffer = getSniffer(win || window);
+        if (sniffer) {
+            try {
+                var cleanTitle = title || document.title || 'Video';
+                var cleanMime = mime || 'video/mp4';
+                if (sniffer.onVideoPlayed) {
+                    sniffer.onVideoPlayed(src, cleanTitle, cleanMime);
+                } else if (sniffer.onMediaDetectedWithDetails) {
+                    sniffer.onMediaDetectedWithDetails(src, cleanTitle, cleanMime);
+                } else if (sniffer.onMediaDetected) {
+                    sniffer.onMediaDetected(src, cleanTitle);
+                }
+            } catch(e) {}
         }
     }
 
-    function notifyMedia(src, title, win) {
-        notifyMediaWithMime(src, title, '', win);
+    // Resolves real video/audio URL from DOM element (handling non-blob, sources, data attributes)
+    function extractRealMediaUrl(mediaEl) {
+        if (!mediaEl) return null;
+
+        var candidates = [
+            mediaEl.currentSrc,
+            mediaEl.src,
+            mediaEl.getAttribute('src'),
+            mediaEl.getAttribute('data-src'),
+            mediaEl.getAttribute('data-url'),
+            mediaEl.getAttribute('data-video'),
+            mediaEl.getAttribute('data-video-src'),
+            mediaEl.getAttribute('data-original')
+        ];
+
+        var sources = mediaEl.querySelectorAll ? mediaEl.querySelectorAll('source') : [];
+        for (var i = 0; i < sources.length; i++) {
+            var s = sources[i];
+            candidates.push(s.src);
+            candidates.push(s.getAttribute('src'));
+            candidates.push(s.getAttribute('data-src'));
+            candidates.push(s.getAttribute('data-url'));
+        }
+
+        for (var j = 0; j < candidates.length; j++) {
+            var url = candidates[j];
+            if (url && typeof url === 'string') {
+                url = url.trim();
+                if (url.startsWith('//')) {
+                    url = window.location.protocol + url;
+                } else if (url.startsWith('/')) {
+                    url = window.location.origin + url;
+                }
+                if (url.startsWith('http://') || url.startsWith('https://')) {
+                    if (!url.startsWith('blob:') && !url.startsWith('data:') && !isImageCandidate(url)) {
+                        return url;
+                    }
+                }
+            }
+        }
+        return null;
     }
 
-    // Hook window.fetch to inspect response Content-Type and media streams
+    function handleMediaElement(mediaEl, sourceEvent) {
+        if (!mediaEl) return;
+        var realUrl = extractRealMediaUrl(mediaEl);
+        if (realUrl) {
+            var title = mediaEl.title || mediaEl.getAttribute('aria-label') || document.title || 'Video';
+            var mime = (mediaEl.tagName === 'AUDIO') ? 'audio/mp4' : 'video/mp4';
+            notifyMediaCandidate(realUrl, title, mime, window);
+        }
+    }
+
+    function attachMediaElementListeners(mediaEl) {
+        if (!mediaEl || mediaEl.__turboListenersAttached) return;
+        mediaEl.__turboListenersAttached = true;
+
+        // 1. Listen to 'play' event
+        mediaEl.addEventListener('play', function() {
+            handleMediaElement(mediaEl, 'play');
+        }, true);
+
+        // 2. Listen to 'loadeddata' event
+        mediaEl.addEventListener('loadeddata', function() {
+            handleMediaElement(mediaEl, 'loadeddata');
+        }, true);
+
+        // 3. Listen to playing & canplay
+        mediaEl.addEventListener('playing', function() {
+            handleMediaElement(mediaEl, 'playing');
+        }, true);
+
+        mediaEl.addEventListener('canplay', function() {
+            handleMediaElement(mediaEl, 'canplay');
+        }, true);
+    }
+
+    // Global document listeners for 'play' and 'loadeddata' events (captures bubbling & capturing phases)
+    try {
+        if (!window.__turboGlobalPlayAttached) {
+            window.__turboGlobalPlayAttached = true;
+            document.addEventListener('play', function(e) {
+                if (e.target && (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO')) {
+                    attachMediaElementListeners(e.target);
+                    handleMediaElement(e.target, 'global_play');
+                }
+            }, true);
+
+            document.addEventListener('loadeddata', function(e) {
+                if (e.target && (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO')) {
+                    attachMediaElementListeners(e.target);
+                    handleMediaElement(e.target, 'global_loadeddata');
+                }
+            }, true);
+        }
+    } catch(e) {}
+
+    // Hook HTMLMediaElement.prototype.src descriptor to catch dynamic 'src' changes
+    try {
+        if (!window.__turboSrcHookAttached) {
+            window.__turboSrcHookAttached = true;
+            var srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+            if (srcDesc && srcDesc.set) {
+                var origSet = srcDesc.set;
+                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                    set: function(val) {
+                        try {
+                            if (val && typeof val === 'string' && !val.startsWith('blob:') && !val.startsWith('data:') && !isImageCandidate(val)) {
+                                var mime = (this.tagName === 'AUDIO') ? 'audio/mp4' : 'video/mp4';
+                                notifyMediaCandidate(val, this.title || document.title, mime, window);
+                            }
+                        } catch(e) {}
+                        return origSet.call(this, val);
+                    },
+                    get: srcDesc.get,
+                    configurable: true,
+                    enumerable: true
+                });
+            }
+        }
+    } catch(e) {}
+
+    // MutationObserver to listen for 'src', 'data-src' and DOM insertions of video/audio/source
+    try {
+        if (!window.__turboMutationObserverAttached) {
+            window.__turboMutationObserverAttached = true;
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(mut) {
+                    if (mut.type === 'attributes') {
+                        var target = mut.target;
+                        if (target && (target.tagName === 'VIDEO' || target.tagName === 'AUDIO')) {
+                            attachMediaElementListeners(target);
+                            handleMediaElement(target, 'attr_' + mut.attributeName);
+                        } else if (target && target.tagName === 'SOURCE' && target.parentElement) {
+                            var parentMedia = target.parentElement;
+                            if (parentMedia.tagName === 'VIDEO' || parentMedia.tagName === 'AUDIO') {
+                                attachMediaElementListeners(parentMedia);
+                                handleMediaElement(parentMedia, 'source_attr_' + mut.attributeName);
+                            }
+                        }
+                    } else if (mut.type === 'childList') {
+                        mut.addedNodes.forEach(function(node) {
+                            if (node.nodeType === 1) {
+                                if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') {
+                                    attachMediaElementListeners(node);
+                                    handleMediaElement(node, 'node_added');
+                                } else if (node.querySelectorAll) {
+                                    var mediaList = node.querySelectorAll('video, audio');
+                                    mediaList.forEach(function(m) {
+                                        attachMediaElementListeners(m);
+                                        handleMediaElement(m, 'subtree_added');
+                                    });
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+            observer.observe(document.documentElement || document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['src', 'data-src', 'data-url', 'data-video', 'data-original']
+            });
+        }
+    } catch(e) {}
+
+    // Hook fetch & XMLHttpRequest to intercept direct media and HLS/DASH manifest streams
     try {
         if (window.fetch && !window.__fetchSnifferAttached) {
             window.__fetchSnifferAttached = true;
@@ -1198,12 +1450,13 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
                             var cType = (response.headers && response.headers.get('content-type')) || '';
                             var lowerUrl = rUrl.toLowerCase();
                             var lowerType = cType.toLowerCase();
-                            if (lowerType.includes('video/') || lowerType.includes('audio/') ||
-                                lowerType.includes('mpegurl') || lowerType.includes('dash+xml') ||
-                                lowerType.includes('vnd.android.package-archive') || lowerType.includes('zip') ||
-                                lowerUrl.includes('.m3u8') || lowerUrl.includes('.mpd') || lowerUrl.includes('.mp4') ||
-                                lowerUrl.includes('.apk') || lowerUrl.includes('.zip')) {
-                                notifyMediaWithMime(rUrl, document.title || 'Medya Akışı', cType, window);
+                            if (!lowerType.includes('image/') && !isImageCandidate(rUrl)) {
+                                if (lowerType.includes('video/') || lowerType.includes('audio/') ||
+                                    lowerType.includes('mpegurl') || lowerType.includes('dash+xml') ||
+                                    lowerUrl.includes('.m3u8') || lowerUrl.includes('.mpd') || lowerUrl.includes('.mp4') ||
+                                    lowerUrl.includes('.webm') || lowerUrl.includes('.mkv')) {
+                                    notifyMediaCandidate(rUrl, document.title || 'Medya Akışı', cType, window);
+                                }
                             }
                         }
                     } catch(e) {}
@@ -1213,7 +1466,6 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
         }
     } catch(e) {}
 
-    // Hook XMLHttpRequest to inspect response Content-Type and media streams
     try {
         if (window.XMLHttpRequest && !window.__xhrSnifferAttached) {
             window.__xhrSnifferAttached = true;
@@ -1232,12 +1484,13 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
                             var cType = xhr.getResponseHeader('Content-Type') || '';
                             var lowerUrl = sUrl.toLowerCase();
                             var lowerType = cType.toLowerCase();
-                            if (lowerType.includes('video/') || lowerType.includes('audio/') ||
-                                lowerType.includes('mpegurl') || lowerType.includes('dash+xml') ||
-                                lowerType.includes('vnd.android.package-archive') || lowerType.includes('zip') ||
-                                lowerUrl.includes('.m3u8') || lowerUrl.includes('.mpd') || lowerUrl.includes('.mp4') ||
-                                lowerUrl.includes('.apk') || lowerUrl.includes('.zip')) {
-                                notifyMediaWithMime(sUrl, document.title || 'Medya Akışı', cType, window);
+                            if (!lowerType.includes('image/') && !isImageCandidate(sUrl)) {
+                                if (lowerType.includes('video/') || lowerType.includes('audio/') ||
+                                    lowerType.includes('mpegurl') || lowerType.includes('dash+xml') ||
+                                    lowerUrl.includes('.m3u8') || lowerUrl.includes('.mpd') || lowerUrl.includes('.mp4') ||
+                                    lowerUrl.includes('.webm') || lowerUrl.includes('.mkv')) {
+                                    notifyMediaCandidate(sUrl, document.title || 'Medya Akışı', cType, window);
+                                }
                             }
                         }
                     } catch(e) {}
@@ -1315,31 +1568,10 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
         try {
             var mediaEls = doc.querySelectorAll('video, audio');
             mediaEls.forEach(function(m) {
-                var title = m.title || m.getAttribute('aria-label') || parentTitle || doc.title || 'Video';
-                if (m.currentSrc) notifyMedia(m.currentSrc, title, win);
-                else if (m.src) notifyMedia(m.src, title, win);
+                attachMediaElementListeners(m);
+                handleMediaElement(m, 'doc_scan');
 
-                var srcs = m.querySelectorAll('source');
-                srcs.forEach(function(s) {
-                    var u = s.src || s.getAttribute('data-src') || s.getAttribute('data-url');
-                    if (u) notifyMedia(u, title, win);
-                });
-
-                // Auto-play muted video to force stream loading
-                try {
-                    m.muted = true;
-                    m.preload = 'auto';
-                    var p = m.play();
-                    if (p !== undefined) {
-                        p.then(function() {
-                            setTimeout(function() {
-                                try { m.pause(); } catch(e) {}
-                            }, 350);
-                        }).catch(function(e) {});
-                    }
-                } catch(e) {}
-
-                // If paused, simulate clicks on the video element itself or its container
+                // If paused, simulate clicks on play buttons or containers
                 if (m.paused) {
                     triggerClickOnElement(m, win);
                     if (m.parentElement) triggerClickOnElement(m.parentElement, win);
@@ -1347,7 +1579,7 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
             });
         } catch(e) {}
 
-        // 2. Click all play buttons in this document!
+        // 2. Click play buttons in this document
         try {
             PLAY_SELECTORS.forEach(function(selector) {
                 var buttons = doc.querySelectorAll(selector);
@@ -1357,34 +1589,7 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
             });
         } catch(e) {}
 
-        // 3. Listen for play events in this document
-        try {
-            if (!doc.__playListenerAttached) {
-                doc.__playListenerAttached = true;
-                doc.addEventListener('play', function(e) {
-                    var t = e.target;
-                    if (t && (t.tagName === 'VIDEO' || t.tagName === 'AUDIO')) {
-                        if (t.currentSrc) notifyMedia(t.currentSrc, t.title || parentTitle, win);
-                        else if (t.src) notifyMedia(t.src, t.title || parentTitle, win);
-                    }
-                }, true);
-            }
-        // Scan direct download and stream links
-        try {
-            var links = doc.querySelectorAll('a[href*=".apk"], a[href*=".zip"], a[href*=".m3u8"], a[href*=".mpd"], a[href*=".mp4"], a[download]');
-            links.forEach(function(a) {
-                var href = a.href;
-                if (href && href.startsWith('http')) {
-                    var lower = href.toLowerCase();
-                    if (lower.includes('.apk') || lower.includes('.zip') || lower.includes('.mp4') || lower.includes('.m3u8') || lower.includes('.mpd')) {
-                        var title = (a.innerText || '').trim() || a.getAttribute('download') || a.title || 'İndirme Bağlantısı';
-                        notifyMedia(href, title, win);
-                    }
-                }
-            });
-        } catch(e) {}
-
-        // 4. Scan iframes recursively inside this document
+        // 3. Scan iframes recursively inside this document
         try {
             var iframes = doc.querySelectorAll('iframe, frame');
             iframes.forEach(function(ifr) {
@@ -1396,7 +1601,6 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
     function processIframe(ifr, parentDoc, parentWin, depth) {
         if (!ifr || depth > 4) return;
 
-        // Ensure iframe allows autoplay and fullscreen
         try {
             ifr.setAttribute('allow', 'autoplay *; fullscreen *; picture-in-picture *');
             ifr.setAttribute('allowfullscreen', 'true');
@@ -1404,25 +1608,19 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
 
         var iSrc = ifr.src || ifr.getAttribute('data-src');
         if (iSrc && (iSrc.includes('youtube.com') || iSrc.includes('youtu.be') || iSrc.includes('vimeo.com') || iSrc.includes('embed') || iSrc.includes('player'))) {
-            notifyMedia(iSrc, 'Gömülü Video - ' + (ifr.title || (parentDoc && parentDoc.title) || 'İframe'), parentWin);
+            notifyMediaCandidate(iSrc, 'Gömülü Video - ' + (ifr.title || (parentDoc && parentDoc.title) || 'İframe'), 'video/mp4', parentWin);
         }
 
-        // Try direct DOM access into the iframe
         var ifrDoc = null;
         var ifrWin = null;
         try {
             ifrDoc = ifr.contentDocument || (ifr.contentWindow && ifr.contentWindow.document);
             ifrWin = ifr.contentWindow;
-        } catch(e) {
-            // Cross-origin iframe
-        }
+        } catch(e) {}
 
         if (ifrDoc) {
-            // Accessible iframe: process document, trigger videos, and CLICK PLAY BUTTONS inside!
             processDocument(ifrDoc, ifrWin || parentWin, (ifr.title || 'İframe Video'), depth);
         } else {
-            // Cross-origin iframe:
-            // 1. Post message play commands across embedded player APIs
             try {
                 var cw = ifr.contentWindow;
                 if (cw) {
@@ -1430,12 +1628,10 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
                     cw.postMessage('{"method":"play"}', '*');
                     cw.postMessage('{"action":"play"}', '*');
                     cw.postMessage('{"type":"play"}', '*');
-                    cw.postMessage(JSON.stringify({ event: 'command', func: 'playVideo' }), '*');
                     cw.postMessage('play', '*');
                 }
             } catch(e) {}
 
-            // 2. Dispatch synthetic click directly onto the center of the iframe
             try {
                 var rect = ifr.getBoundingClientRect();
                 if (rect.width > 20 && rect.height > 20) {
@@ -1455,7 +1651,6 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
             } catch(e) {}
         }
 
-        // Attach 'load' listener on the iframe to re-process once its internal content finishes loading
         try {
             if (!ifr.__loadListenerAttached) {
                 ifr.__loadListenerAttached = true;
@@ -1475,7 +1670,7 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
         try {
             var ogV = document.querySelector('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"]');
             if (ogV && ogV.content) {
-                notifyMedia(ogV.content, document.title, window);
+                notifyMediaCandidate(ogV.content, document.title, 'video/mp4', window);
             }
         } catch(e) {}
     }
@@ -1488,13 +1683,6 @@ private val INJECTED_MEDIA_SNIFFER_JS = """
     [400, 1200, 2500, 5000].forEach(function(delay) {
         setTimeout(scanAll, delay);
     });
-
-    try {
-        var obs = new MutationObserver(function() {
-            scanAll();
-        });
-        obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
-    } catch(e) {}
 
     document.addEventListener('click', function() {
         setTimeout(scanAll, 300);
